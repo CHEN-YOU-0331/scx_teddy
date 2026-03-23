@@ -31,10 +31,15 @@ typedef signed long s64;
 #define TIER_CRITICAL 0
 #define TIER_INTERACTIVE 1
 #define TIER_NORMAL 2
-#define TIER_OTHER 3
+#define TIER_BATCH 3
+
+typedef struct task_info {
+    s32 prio; // 0, 1, 2, 3
+    u64 slice; // ns
+} sched_info_t;
 
 typedef struct target_ctx {
-    s32 prio; // 0, 1, 2
+    s32 prio; // 0, 1, 2, 3
     u64 slice; // ns
     u8 config;
     /* | 7 bits NOP | 1 bits ecore |*/

@@ -30,6 +30,13 @@ struct {
     __type(value, u32);
 } scheduler_config SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256 * 1024);
+    __type(key, s32);
+    __type(value, sched_info_t);
+} update_map SEC(".maps");
+
 static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
@@ -70,7 +77,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
             return NULL;
         s32 key = p->pid;
         target_ctx->slice = DEFAULT_SLICE;
-        target_ctx->prio = TIER_OTHER;
+        target_ctx->prio = TIER_BATCH;
         target_ctx->config = 1;
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
@@ -93,7 +100,7 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
     target_ctx_t *target_ctx = get_target_storage(p);
-    if (!target_ctx || target_ctx->prio == TIER_OTHER) {
+    if (!target_ctx || target_ctx->prio == TIER_BATCH) {
         scx_bpf_dsq_insert(p, OTHER_DSQ, DEFAULT_SLICE, wake_flags);
         return prev_cpu;
     }
@@ -118,7 +125,7 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
 {
     target_ctx_t *target_ctx = get_target_storage(p);
-    if (!target_ctx || target_ctx->prio == TIER_OTHER) {
+    if (!target_ctx || target_ctx->prio == TIER_BATCH) {
         scx_bpf_dsq_insert(p, OTHER_DSQ, DEFAULT_SLICE, enq_flags);
         return;
     }
@@ -192,6 +199,15 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         target_ctx->sleep_start = now;
     } else if (target_ctx->runtime_ns >= 1000000000)
         data_to_user(p, target_ctx);
+
+    s32 key = p->pid;
+    sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
+    if (unlikely(update_info)) {
+        target_ctx->prio = update_info->prio;
+        target_ctx->slice = update_info->slice;
+        bpf_map_delete_elem(&update_map, &key);
+    }
+
 }
 
 void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
