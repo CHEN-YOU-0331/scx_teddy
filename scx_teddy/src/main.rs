@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //! scx_teddy - A BPF scheduler based on task runtime characteristics
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use plain::Plain;
 
 use libbpf_rs::skel::OpenSkel;
@@ -33,19 +34,44 @@ mod bpf_intf {
 #[allow(clippy::wildcard_imports)]
 use bpf_skel::*;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct TaskConfig {
-    tid: i32,
-    prio: i32,
-    slice: u64,
-    on_ecore: u8,
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "slice_mode")]
+enum SliceConfig {
+    /// slice = avg_runtime_ns + sigma * stddev_runtime_ns
+    #[serde(rename = "adaptive")]
+    Adaptive { slice_sigma: f64 },
+    /// slice = fixed value in ns
+    #[serde(rename = "fixed")]
+    Fixed { slice_ns: u64 },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Config {
-    target_mode: i32,
-    tgid: Option<i32>,
-    tasks: Vec<TaskConfig>,
+#[derive(Debug, Deserialize, Clone)]
+struct ClusterSchedConfig {
+    prio: i32,
+    #[serde(flatten)]
+    slice: SliceConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchedConfig {
+    clusters: HashMap<String, ClusterSchedConfig>,
+    default: ClusterSchedConfig,
+}
+
+impl ClusterSchedConfig {
+    /// Compute the slice in ns for a task given its runtime stats.
+    /// features[1] = avg_runtime_ms, features[2] = stddev_runtime_ms
+    fn compute_slice_ns(&self, features: &[f64; 15]) -> u64 {
+        match &self.slice {
+            SliceConfig::Adaptive { slice_sigma } => {
+                let avg_ns = features[1] * 1_000_000.0;
+                let std_ns = features[2] * 1_000_000.0;
+                let slice = avg_ns + slice_sigma * std_ns;
+                (slice.max(1000.0)) as u64 // at least 1us
+            }
+            SliceConfig::Fixed { slice_ns } => *slice_ns,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -75,6 +101,10 @@ struct Args {
     /// Path to trained model JSON (classify mode)
     #[arg(long)]
     model: Option<String>,
+
+    /// Path to scheduling config JSON (classify mode)
+    #[arg(long)]
+    config: Option<String>,
 }
 
 #[repr(C)]
@@ -123,15 +153,24 @@ fn main() -> Result<()> {
         _ => anyhow::bail!("Invalid mode '{}'. Use 'collect' or 'classify'.", args.mode),
     }
 
-    // Load model for classify mode
-    let model = if args.mode == "classify" {
+    // Load model and config for classify mode
+    let (model, sched_config) = if args.mode == "classify" {
         let model_path = args.model.as_deref()
             .context("Classify mode requires --model <path>")?;
         let m = classifier::load_model(model_path)?;
         println!("Loaded model from {} ({} clusters)", model_path, m.n_clusters());
-        Some(m)
+
+        let config_path = args.config.as_deref()
+            .context("Classify mode requires --config <path>")?;
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read config: {}", config_path))?;
+        let cfg: SchedConfig = serde_json::from_str(&content)
+            .context("Failed to parse scheduling config")?;
+        println!("Loaded scheduling config from {}", config_path);
+
+        (Some(m), Some(cfg))
     } else {
-        None
+        (None, None)
     };
 
     println!("scx_teddy scheduler starting...");
@@ -189,10 +228,11 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
 
-            if let Some(ref classifier) = model {
-                // Classify mode: predict cluster for each task
+            if let (Some(ref classifier), Some(ref cfg)) = (&model, &sched_config) {
+                // Classify mode: predict cluster and update BPF map
                 let n = classifier.n_clusters();
                 let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
+                let update_map = &skel.maps.update_map;
 
                 for (&tid, task_stats) in stats_map.iter() {
                     if task_stats.exit != 0 {
@@ -204,11 +244,31 @@ fn main() -> Result<()> {
                     }
                     let cluster = classifier.predict(&features);
                     cluster_tids[cluster].push(tid);
+
+                    let cluster_cfg = cfg.clusters
+                        .get(&cluster.to_string())
+                        .unwrap_or(&cfg.default);
+
+                    let prio = cluster_cfg.prio;
+                    let slice_ns = cluster_cfg.compute_slice_ns(&features);
+
+                    // Write sched_info_t {prio: s32, slice: u64} to update_map
+                    // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
+                    let tid_key = tid.to_ne_bytes();
+                    let mut val_buf = [0u8; 16];
+                    val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
+                    val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
+                    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
                 }
 
-                println!("Classification results:");
+                println!("Classification results (updated {} tasks):",
+                    cluster_tids.iter().map(|v| v.len()).sum::<usize>());
                 for (i, tids) in cluster_tids.iter().enumerate() {
-                    println!("  Cluster {} ({} tasks): {:?}", i, tids.len(), tids);
+                    let cluster_cfg = cfg.clusters
+                        .get(&i.to_string())
+                        .unwrap_or(&cfg.default);
+                    println!("  Cluster {} (prio={}, {} tasks)",
+                        i, cluster_cfg.prio, tids.len());
                 }
             } else {
                 // Collect mode: write stats to CSV
