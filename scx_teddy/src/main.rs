@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //! scx_teddy - A BPF scheduler based on task runtime characteristics
 
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +16,10 @@ use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
+
+mod task_stats;
+
+use task_stats::TaskStats;
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -49,94 +54,22 @@ struct Args {
     /// Verbose output
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+
+    /// Data collection interval in seconds
     #[arg(short, long, default_value_t = 600)]
     collect_duration: u64,
-}
 
-#[derive(Debug, Clone, Default)]
-struct TaskStats {
-    // Runtime statistics
-    runtime_sum: u64,
-    runtime_sum_sq: f64,  // Sum of squares for variance calculation
-    runtime_min: u64,
-    runtime_max: u64,
+    /// Mode: "collect" to generate event.csv, "classify" to use a trained model
+    #[arg(short, long, default_value = "collect")]
+    mode: String,
 
-    // Sleep statistics
-    sleep_sum: u64,
-    sleep_sum_sq: f64,
-    sleep_min: u64,
-    sleep_max: u64,
-    sleep_count: u64,  // Number of events with sleep
+    /// Minimum event count to include a task in event.csv (filter inactive tasks)
+    #[arg(long, default_value_t = 3)]
+    min_events: u64,
 
-    // Sleep interval statistics (time between sleeps)
-    last_sleep_end: u64,
-    sleep_interval_sum: u64,
-    sleep_interval_sum_sq: f64,
-    sleep_interval_min: u64,
-    sleep_interval_max: u64,
-    sleep_interval_count: u64,
-
-    event_count: u64,
-    parent: i32,
-    exit: u8,
-}
-
-impl TaskStats {
-    fn new(parent: i32) -> Self {
-        Self {
-            runtime_sum: 0,
-            runtime_sum_sq: 0.0,
-            runtime_min: u64::MAX,
-            runtime_max: 0,
-
-            sleep_sum: 0,
-            sleep_sum_sq: 0.0,
-            sleep_min: u64::MAX,
-            sleep_max: 0,
-            sleep_count: 0,
-
-            last_sleep_end: 0,
-            sleep_interval_sum: 0,
-            sleep_interval_sum_sq: 0.0,
-            sleep_interval_min: u64::MAX,
-            sleep_interval_max: 0,
-            sleep_interval_count: 0,
-
-            event_count: 0,
-            parent,
-            exit: 0,
-        }
-    }
-
-    fn update(&mut self, runtime_ns: u64, sleep_ns: u64, sleep_end: u64) {
-        self.event_count += 1;
-
-        // Update runtime statistics
-        self.runtime_sum += runtime_ns;
-        self.runtime_sum_sq += (runtime_ns as f64) * (runtime_ns as f64);
-        self.runtime_min = self.runtime_min.min(runtime_ns);
-        self.runtime_max = self.runtime_max.max(runtime_ns);
-
-        // Update sleep statistics
-        if sleep_ns > 0 {
-            self.sleep_count += 1;
-            self.sleep_sum += sleep_ns;
-            self.sleep_sum_sq += (sleep_ns as f64) * (sleep_ns as f64);
-            self.sleep_min = self.sleep_min.min(sleep_ns);
-            self.sleep_max = self.sleep_max.max(sleep_ns);
-
-            // Update sleep interval statistics
-            if self.last_sleep_end > 0 && sleep_end > self.last_sleep_end {
-                let interval = sleep_end - self.last_sleep_end;
-                self.sleep_interval_count += 1;
-                self.sleep_interval_sum += interval;
-                self.sleep_interval_sum_sq += (interval as f64) * (interval as f64);
-                self.sleep_interval_min = self.sleep_interval_min.min(interval);
-                self.sleep_interval_max = self.sleep_interval_max.max(interval);
-            }
-            self.last_sleep_end = sleep_end;
-        }
-    }
+    /// Output CSV file path (collect mode)
+    #[arg(short, long, default_value = "event.csv")]
+    output: String,
 }
 
 #[repr(C)]
@@ -175,8 +108,20 @@ fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, T
     0
 }
 
+const CSV_HEADER: &str = "tid,event_count,avg_runtime_ms,stddev_runtime_ms,runtime_min_ms,runtime_max_ms,sleep_count,avg_sleep_ms,stddev_sleep_ms,sleep_min_ms,sleep_max_ms,sleep_interval_count,avg_sleep_interval_ms,stddev_sleep_interval_ms,sleep_interval_min_ms,sleep_interval_max_ms";
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    match args.mode.as_str() {
+        "collect" | "classify" => {}
+        _ => anyhow::bail!("Invalid mode '{}'. Use 'collect' or 'classify'.", args.mode),
+    }
+
+    if args.mode == "classify" {
+        println!("Classify mode is not yet implemented.");
+        return Ok(());
+    }
     println!("scx_teddy scheduler starting...");
 
     // Build and load eBPF skeleton
@@ -231,10 +176,38 @@ fn main() -> Result<()> {
             let mut val = 1u32.to_ne_bytes();
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
-            for (&tid, task_stats) in stats_map.iter() {
-                println!("TID: {}, Event cnt: {}, parent: {}, runtime: {}, exit: {}", 
-                tid, task_stats.event_count, task_stats.parent, task_stats.runtime_sum, task_stats.exit);
+
+            // Write collected stats to CSV
+            let file_exists = std::path::Path::new(&args.output).exists();
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&args.output)
+                .context("Failed to open output CSV")?;
+
+            if !file_exists {
+                writeln!(file, "{}", CSV_HEADER)
+                    .context("Failed to write CSV header")?;
             }
+
+            let mut count = 0u64;
+            for (&tid, task_stats) in stats_map.iter() {
+                if task_stats.exit != 0 {
+                    continue;
+                }
+                let stats_arr = task_stats.get_stats();
+                // stats_arr[0] is event_count
+                if (stats_arr[0] as u64) < args.min_events {
+                    println!("{} too few data", tid);
+                    continue;
+                }
+                let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
+                writeln!(file, "{},{}", tid, values.join(","))
+                    .context("Failed to write CSV row")?;
+                count += 1;
+            }
+            println!("Wrote {} tasks to {}", count, args.output);
+
             stats_map.clear();
             start_time = Instant::now();
             val = 0u32.to_ne_bytes();

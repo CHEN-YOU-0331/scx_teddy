@@ -3,3 +3,5 @@
 *.skel.rs
 target
 *.json
+*.csv
+TODO.md
