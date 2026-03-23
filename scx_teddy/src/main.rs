@@ -17,6 +17,7 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 
+mod classifier;
 mod task_stats;
 
 use task_stats::TaskStats;
@@ -70,6 +71,10 @@ struct Args {
     /// Output CSV file path (collect mode)
     #[arg(short, long, default_value = "event.csv")]
     output: String,
+
+    /// Path to trained model JSON (classify mode)
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[repr(C)]
@@ -118,10 +123,17 @@ fn main() -> Result<()> {
         _ => anyhow::bail!("Invalid mode '{}'. Use 'collect' or 'classify'.", args.mode),
     }
 
-    if args.mode == "classify" {
-        println!("Classify mode is not yet implemented.");
-        return Ok(());
-    }
+    // Load model for classify mode
+    let model = if args.mode == "classify" {
+        let model_path = args.model.as_deref()
+            .context("Classify mode requires --model <path>")?;
+        let m = classifier::load_model(model_path)?;
+        println!("Loaded model from {} ({} clusters)", model_path, m.n_clusters());
+        Some(m)
+    } else {
+        None
+    };
+
     println!("scx_teddy scheduler starting...");
 
     // Build and load eBPF skeleton
@@ -177,36 +189,58 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
 
-            // Write collected stats to CSV
-            let file_exists = std::path::Path::new(&args.output).exists();
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&args.output)
-                .context("Failed to open output CSV")?;
+            if let Some(ref classifier) = model {
+                // Classify mode: predict cluster for each task
+                let n = classifier.n_clusters();
+                let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
 
-            if !file_exists {
-                writeln!(file, "{}", CSV_HEADER)
-                    .context("Failed to write CSV header")?;
-            }
+                for (&tid, task_stats) in stats_map.iter() {
+                    if task_stats.exit != 0 {
+                        continue;
+                    }
+                    let features = task_stats.get_stats();
+                    if (features[0] as u64) < args.min_events {
+                        continue;
+                    }
+                    let cluster = classifier.predict(&features);
+                    cluster_tids[cluster].push(tid);
+                }
 
-            let mut count = 0u64;
-            for (&tid, task_stats) in stats_map.iter() {
-                if task_stats.exit != 0 {
-                    continue;
+                println!("Classification results:");
+                for (i, tids) in cluster_tids.iter().enumerate() {
+                    println!("  Cluster {} ({} tasks): {:?}", i, tids.len(), tids);
                 }
-                let stats_arr = task_stats.get_stats();
-                // stats_arr[0] is event_count
-                if (stats_arr[0] as u64) < args.min_events {
-                    println!("{} too few data", tid);
-                    continue;
+            } else {
+                // Collect mode: write stats to CSV
+                let file_exists = std::path::Path::new(&args.output).exists();
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&args.output)
+                    .context("Failed to open output CSV")?;
+
+                if !file_exists {
+                    writeln!(file, "{}", CSV_HEADER)
+                        .context("Failed to write CSV header")?;
                 }
-                let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
-                writeln!(file, "{},{}", tid, values.join(","))
-                    .context("Failed to write CSV row")?;
-                count += 1;
+
+                let mut count = 0u64;
+                for (&tid, task_stats) in stats_map.iter() {
+                    if task_stats.exit != 0 {
+                        continue;
+                    }
+                    let stats_arr = task_stats.get_stats();
+                    if (stats_arr[0] as u64) < args.min_events {
+                        println!("{} too few data", tid);
+                        continue;
+                    }
+                    let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
+                    writeln!(file, "{},{}", tid, values.join(","))
+                        .context("Failed to write CSV row")?;
+                    count += 1;
+                }
+                println!("Wrote {} tasks to {}", count, args.output);
             }
-            println!("Wrote {} tasks to {}", count, args.output);
 
             stats_map.clear();
             start_time = Instant::now();
