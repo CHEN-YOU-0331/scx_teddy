@@ -1,31 +1,6 @@
 # scx_teddy
 
-An eBPF-based experimental scheduler that collects task runtime data online and exposes it to userspace. This provides a foundation for future scheduling optimizations using ML models or agents.
-
-## Building
-
-```bash
-cargo build --release
-```
-
-## Usage
-
-```bash
-sudo ./target/release/scx_teddy [OPTIONS]
-```
-
-**Options:**
-- `-v, --verbose` - Enable verbose output
-- `-c, --collect-duration <SECONDS>` - Data collection interval in seconds (default: 600)
-
-**Example:**
-
-```bash
-# Collect and report statistics every 60 seconds
-sudo ./target/release/scx_teddy -c 60
-```
-
-After each interval, the scheduler prints event counts per TID and resets counters for the next collection period.
+An eBPF-based experimental scheduler that collects task runtime behavior online, clusters tasks using ML models (K-means), and dynamically adjusts scheduling priorities and time slices per cluster.
 
 ## Requirements
 
@@ -33,6 +8,88 @@ After each interval, the scheduler prints event counts per TID and resets counte
 - Root privileges (required for eBPF operations)
 - Rust toolchain
 - libbpf
+- Python 3 with `numpy`, `pandas`, `scikit-learn` (for training)
+
+## Building
+
+```bash
+cargo build --release
+```
+
+Install Python dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+scx_teddy operates in two modes: **collect** (gather task data) and **classify** (apply a trained model to schedule tasks).
+
+### Step 1: Collect Task Data
+
+Run the scheduler in collect mode to record task behavior into a CSV file:
+
+```bash
+sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
+```
+
+**Options:**
+- `-m, --mode <MODE>` - Operating mode: `collect` or `classify` (default: `collect`)
+- `-c, --collect-duration <SECONDS>` - Data collection interval in seconds (default: 600)
+- `-o, --output <PATH>` - Output CSV file path (default: `event.csv`)
+- `--min-events <N>` - Minimum event count to include a task (default: 3)
+- `-v, --verbose` - Enable verbose output
+
+### Step 2: Train a K-means Model
+
+Use the training script to cluster tasks based on their runtime characteristics:
+
+```bash
+python3 train.py event.csv -o model.json
+```
+
+This will:
+- Automatically select the number of clusters using the elbow method (or specify with `-k`)
+- Export the model (centroids + scaler) to a JSON file
+- Print per-cluster statistics and task membership (tid, tgid, ppid, command)
+- Save classification results to `model_result.json`
+
+**Options:**
+- `-o, --output <PATH>` - Output model JSON path (default: `model.json`)
+- `-k, --clusters <N>` - Number of clusters (auto-detect if not specified)
+
+### Step 3: Configure Scheduling Policy
+
+Create a `config.json` that maps each cluster to a priority and time slice policy:
+
+```json
+{
+  "clusters": {
+    "0": { "prio": 2, "slice_mode": "adaptive", "slice_sigma": 1.0 },
+    "1": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 },
+    "4": { "prio": 0, "slice_mode": "adaptive", "slice_sigma": 2.0 }
+  },
+  "default": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 }
+}
+```
+
+- **prio**: Scheduling priority tier (0 = critical, 1 = interactive, 2 = normal, 3 = batch)
+- **slice_mode**:
+  - `adaptive`: time slice = avg_runtime + sigma * stddev_runtime (computed per task)
+  - `fixed`: time slice = fixed value in nanoseconds
+
+### Step 4: Run with Classification
+
+Apply the trained model to dynamically classify tasks and update scheduling parameters:
+
+```bash
+sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config config.json
+```
+
+**Additional options for classify mode:**
+- `--model <PATH>` - Path to trained model JSON (required)
+- `--config <PATH>` - Path to scheduling config JSON (required)
 
 ---
 

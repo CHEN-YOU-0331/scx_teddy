@@ -1,31 +1,6 @@
 # scx_teddy
 
-一個基於 eBPF 的實驗性排程器，能夠在線收集任務執行資料並傳遞給使用者空間。這為未來使用 ML 模型或 agent 進行排程優化提供了基礎。
-
-## 建置
-
-```bash
-cargo build --release
-```
-
-## 使用方式
-
-```bash
-sudo ./target/release/scx_teddy [選項]
-```
-
-**選項：**
-- `-v, --verbose` - 啟用詳細輸出
-- `-c, --collect-duration <秒數>` - 資料收集間隔（秒），預設為 600
-
-**範例：**
-
-```bash
-# 每 60 秒收集並報告統計資料
-sudo ./target/release/scx_teddy -c 60
-```
-
-每個時間間隔後，排程器會印出每個 TID 的事件數量，並重置計數器以進行下一輪收集。
+一個基於 eBPF 的實驗性排程器，能夠在線收集任務執行行為，使用 ML 模型（K-means）對任務進行分群，並根據分群結果動態調整排程優先權與時間片。
 
 ## 系統需求
 
@@ -33,6 +8,88 @@ sudo ./target/release/scx_teddy -c 60
 - Root 權限（eBPF 操作所需）
 - Rust 工具鏈
 - libbpf
+- Python 3 及 `numpy`、`pandas`、`scikit-learn`（訓練用）
+
+## 建置
+
+```bash
+cargo build --release
+```
+
+安裝 Python 依賴：
+
+```bash
+pip install -r requirements.txt
+```
+
+## 使用方式
+
+scx_teddy 有兩種模式：**collect**（收集任務資料）和 **classify**（套用訓練好的模型進行排程）。
+
+### 步驟一：收集任務資料
+
+以 collect 模式執行排程器，將任務行為記錄到 CSV 檔案：
+
+```bash
+sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
+```
+
+**選項：**
+- `-m, --mode <模式>` - 運作模式：`collect` 或 `classify`（預設：`collect`）
+- `-c, --collect-duration <秒數>` - 資料收集間隔，單位為秒（預設：600）
+- `-o, --output <路徑>` - 輸出 CSV 檔案路徑（預設：`event.csv`）
+- `--min-events <N>` - 最低事件數門檻，低於此數的任務會被忽略（預設：3）
+- `-v, --verbose` - 啟用詳細輸出
+
+### 步驟二：訓練 K-means 模型
+
+使用訓練腳本，根據任務的執行特徵進行分群：
+
+```bash
+python3 train.py event.csv -o model.json
+```
+
+這會：
+- 使用手肘法自動選擇分群數量（或以 `-k` 手動指定）
+- 將模型（中心點 + 標準化參數）匯出為 JSON 檔案
+- 印出每個 cluster 的特徵統計與任務成員（tid、tgid、ppid、command）
+- 將分類結果儲存至 `model_result.json`
+
+**選項：**
+- `-o, --output <路徑>` - 模型 JSON 輸出路徑（預設：`model.json`）
+- `-k, --clusters <N>` - 分群數量（未指定則自動偵測）
+
+### 步驟三：設定排程策略
+
+建立 `config.json`，將每個 cluster 對應到優先權與時間片策略：
+
+```json
+{
+  "clusters": {
+    "0": { "prio": 2, "slice_mode": "adaptive", "slice_sigma": 1.0 },
+    "1": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 },
+    "4": { "prio": 0, "slice_mode": "adaptive", "slice_sigma": 2.0 }
+  },
+  "default": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 }
+}
+```
+
+- **prio**：排程優先權層級（0 = critical、1 = interactive、2 = normal、3 = batch）
+- **slice_mode**：
+  - `adaptive`：時間片 = 平均執行時間 + sigma * 標準差（依每個任務計算）
+  - `fixed`：時間片 = 固定值，單位為奈秒
+
+### 步驟四：以分類模式執行
+
+套用訓練好的模型，動態分類任務並更新排程參數：
+
+```bash
+sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config config.json
+```
+
+**分類模式額外選項：**
+- `--model <路徑>` - 訓練好的模型 JSON 路徑（必填）
+- `--config <路徑>` - 排程設定 JSON 路徑（必填）
 
 ---
 
