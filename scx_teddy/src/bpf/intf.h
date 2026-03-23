@@ -17,10 +17,10 @@ typedef signed long s64;
 #define MODE_TID    0  
 #define MODE_TGID   1
 
-#define OTHER_DSQ 200
-#define CRITICAL_DSQ 201
-#define INTERACTIVE_DSQ 202
-#define NORMAL_DSQ 203
+#define CRITICAL_DSQ 200
+#define INTERACTIVE_DSQ 201
+#define NORMAL_DSQ 202
+#define OTHER_DSQ 203
 #define CRITICAL_WAKEUP_DSQ 204
 #define INTERACTIVE_WAKEUP_DSQ 205
 
