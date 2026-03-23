@@ -1,5 +1,5 @@
-*.txt
 *.lock
+*.log
 *.skel.rs
 target
 *.json
