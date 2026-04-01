@@ -26,6 +26,14 @@ pub struct TaskStats {
     pub exit: u8,
 }
 
+fn get_real_min(x: u64) -> u64
+{
+    if x == u64::MAX {
+        return 0;
+    } 
+    x
+}
+
 impl TaskStats {
     pub fn new(parent: i32) -> Self {
         Self {
@@ -143,19 +151,19 @@ impl TaskStats {
             // Runtime statistics
             self.avg_runtime_ms(),
             self.stddev_runtime_ms(),
-            self.runtime_min as f64 / 1_000_000.0,
+            get_real_min(self.runtime_min) as f64 / 1_000_000.0,
             self.runtime_max as f64 / 1_000_000.0,
             // Sleep statistics
             self.sleep_count as f64,
             self.avg_sleep_ms(),
             self.stddev_sleep_ms(),
-            self.sleep_min as f64 / 1_000_000.0,
+            get_real_min(self.sleep_min) as f64 / 1_000_000.0,
             self.sleep_max as f64 / 1_000_000.0,
             // Sleep interval statistics
             self.sleep_interval_count as f64,
             self.avg_sleep_interval_ms(),
             self.stddev_sleep_interval_ms(),
-            self.sleep_interval_min as f64 / 1_000_000.0,
+            get_real_min(self.sleep_interval_min) as f64 / 1_000_000.0,
             self.sleep_interval_max as f64 / 1_000_000.0,
         ]
     }
