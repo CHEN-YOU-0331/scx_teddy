@@ -174,7 +174,8 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
-    target_ctx->sleep_end = scx_bpf_now();
+    if (enq_flags & SCX_ENQ_WAKEUP)
+        target_ctx->sleep_end = scx_bpf_now();
 }
 
 void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
