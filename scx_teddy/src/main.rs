@@ -69,8 +69,10 @@ impl ClusterSchedConfig {
                         .map(|(_, v)| *v)
                         .unwrap_or(0.0)
                 };
-                let avg_ns = lookup("avg_runtime_ms") * 1_000_000.0;
-                let std_ns = lookup("stddev_runtime_ms") * 1_000_000.0;
+                let avg_ms = lookup("avg_runtime_ms");
+                let cv = lookup("runtime_cv");
+                let avg_ns = avg_ms * 1_000_000.0;
+                let std_ns = avg_ms * cv * 1_000_000.0;
                 let slice = avg_ns + slice_sigma * std_ns;
                 (slice.max(1000.0)) as u64 // at least 1us
             }
