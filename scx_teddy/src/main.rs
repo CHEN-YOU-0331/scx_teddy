@@ -59,13 +59,18 @@ struct SchedConfig {
 }
 
 impl ClusterSchedConfig {
-    /// Compute the slice in ns for a task given its runtime stats.
-    /// features[1] = avg_runtime_ms, features[2] = stddev_runtime_ms
-    fn compute_slice_ns(&self, features: &[f64; 15]) -> u64 {
+    /// Compute the slice in ns for a task given its named runtime stats.
+    fn compute_slice_ns(&self, named_stats: &[(&str, f64)]) -> u64 {
         match &self.slice {
             SliceConfig::Adaptive { slice_sigma } => {
-                let avg_ns = features[1] * 1_000_000.0;
-                let std_ns = features[2] * 1_000_000.0;
+                let lookup = |name: &str| -> f64 {
+                    named_stats.iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                };
+                let avg_ns = lookup("avg_runtime_ms") * 1_000_000.0;
+                let std_ns = lookup("stddev_runtime_ms") * 1_000_000.0;
                 let slice = avg_ns + slice_sigma * std_ns;
                 (slice.max(1000.0)) as u64 // at least 1us
             }
@@ -143,7 +148,15 @@ fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, T
     0
 }
 
-const CSV_HEADER: &str = "tid,event_count,avg_runtime_ms,stddev_runtime_ms,runtime_min_ms,runtime_max_ms,sleep_count,avg_sleep_ms,stddev_sleep_ms,sleep_min_ms,sleep_max_ms,sleep_interval_count,avg_sleep_interval_ms,stddev_sleep_interval_ms,sleep_interval_min_ms,sleep_interval_max_ms";
+fn csv_header() -> String {
+    let feature_names = TaskStats::get_feature_names();
+    let mut header = String::from("tid");
+    for name in &feature_names {
+        header.push(',');
+        header.push_str(name);
+    }
+    header
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -238,7 +251,8 @@ fn main() -> Result<()> {
                     if task_stats.exit != 0 {
                         continue;
                     }
-                    let features = task_stats.get_stats();
+                    let named_stats = task_stats.get_named_stats();
+                    let features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
                     if (features[0] as u64) < args.min_events {
                         continue;
                     }
@@ -250,7 +264,7 @@ fn main() -> Result<()> {
                         .unwrap_or(&cfg.default);
 
                     let prio = cluster_cfg.prio;
-                    let slice_ns = cluster_cfg.compute_slice_ns(&features);
+                    let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
 
                     // Write sched_info_t {prio: s32, slice: u64} to update_map
                     // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
@@ -280,7 +294,7 @@ fn main() -> Result<()> {
                     .context("Failed to open output CSV")?;
 
                 if !file_exists {
-                    writeln!(file, "{}", CSV_HEADER)
+                    writeln!(file, "{}", csv_header())
                         .context("Failed to write CSV header")?;
                 }
 

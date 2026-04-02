@@ -145,26 +145,40 @@ impl TaskStats {
         }
     }
 
-    pub fn get_stats(&self) -> [f64; 15] {
-        [
-            self.event_count as f64,
+    /// Returns (name, value) pairs for all features.
+    /// The order here defines the CSV column order and feature vector order.
+    pub fn get_named_stats(&self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("event_count", self.event_count as f64),
             // Runtime statistics
-            self.avg_runtime_ms(),
-            self.stddev_runtime_ms(),
-            get_real_min(self.runtime_min) as f64 / 1_000_000.0,
-            self.runtime_max as f64 / 1_000_000.0,
+            ("avg_runtime_ms", self.avg_runtime_ms()),
+            ("stddev_runtime_ms", self.stddev_runtime_ms()),
+            ("runtime_min_ms", get_real_min(self.runtime_min) as f64 / 1_000_000.0),
+            ("runtime_max_ms", self.runtime_max as f64 / 1_000_000.0),
             // Sleep statistics
-            self.sleep_count as f64,
-            self.avg_sleep_ms(),
-            self.stddev_sleep_ms(),
-            get_real_min(self.sleep_min) as f64 / 1_000_000.0,
-            self.sleep_max as f64 / 1_000_000.0,
+            ("sleep_count", self.sleep_count as f64),
+            ("avg_sleep_ms", self.avg_sleep_ms()),
+            ("stddev_sleep_ms", self.stddev_sleep_ms()),
+            ("sleep_min_ms", get_real_min(self.sleep_min) as f64 / 1_000_000.0),
+            ("sleep_max_ms", self.sleep_max as f64 / 1_000_000.0),
             // Sleep interval statistics
-            self.sleep_interval_count as f64,
-            self.avg_sleep_interval_ms(),
-            self.stddev_sleep_interval_ms(),
-            get_real_min(self.sleep_interval_min) as f64 / 1_000_000.0,
-            self.sleep_interval_max as f64 / 1_000_000.0,
+            ("sleep_interval_count", self.sleep_interval_count as f64),
+            ("avg_sleep_interval_ms", self.avg_sleep_interval_ms()),
+            ("stddev_sleep_interval_ms", self.stddev_sleep_interval_ms()),
+            ("sleep_interval_min_ms", get_real_min(self.sleep_interval_min) as f64 / 1_000_000.0),
+            ("sleep_interval_max_ms", self.sleep_interval_max as f64 / 1_000_000.0),
         ]
+    }
+
+    /// Returns feature values as a Vec (order matches get_named_stats).
+    pub fn get_stats(&self) -> Vec<f64> {
+        self.get_named_stats().into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Returns feature names (order matches get_stats).
+    pub fn get_feature_names() -> Vec<&'static str> {
+        // Construct a dummy instance just to get the names.
+        // This is zero-cost in practice since the names are static.
+        Self::default().get_named_stats().into_iter().map(|(n, _)| n).collect()
     }
 }

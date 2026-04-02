@@ -11,15 +11,9 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 
-FEATURE_COLUMNS = [
-    "event_count",
-    "avg_runtime_ms", "stddev_runtime_ms", "runtime_min_ms", "runtime_max_ms",
-    "sleep_count",
-    "avg_sleep_ms", "stddev_sleep_ms", "sleep_min_ms", "sleep_max_ms",
-    "sleep_interval_count",
-    "avg_sleep_interval_ms", "stddev_sleep_interval_ms",
-    "sleep_interval_min_ms", "sleep_interval_max_ms",
-]
+def get_feature_columns(df):
+    """Derive feature columns from the DataFrame (all columns except 'tid')."""
+    return [col for col in df.columns if col != "tid"]
 
 
 def find_best_k(X_scaled, k_range=range(2, 11)):
@@ -43,7 +37,8 @@ def train(csv_path, output_path, n_clusters=None):
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} tasks from {csv_path}")
 
-    X = df[FEATURE_COLUMNS].values
+    feature_columns = get_feature_columns(df)
+    X = df[feature_columns].values
     tids = df["tid"].values
 
     # Standardize
@@ -67,7 +62,7 @@ def train(csv_path, output_path, n_clusters=None):
     model_data = {
         "algorithm": "kmeans",
         "n_clusters": n_clusters,
-        "features": FEATURE_COLUMNS,
+        "features": feature_columns,
         "scaler": {
             "mean": scaler.mean_.tolist(),
             "std": scaler.scale_.tolist(),
@@ -87,7 +82,7 @@ def train(csv_path, output_path, n_clusters=None):
         mask = labels == c
         cluster_df = df[mask]
         print(f"\n--- Cluster {c} ({mask.sum()} tasks) ---")
-        print(cluster_df[FEATURE_COLUMNS].describe().to_string())
+        print(cluster_df[feature_columns].describe().to_string())
 
     # Build cluster membership with tgid from /proc
     print(f"\n{'='*60}")
