@@ -1,3 +1,15 @@
+#[repr(C)]
+pub struct TaskEvent {
+    pub tid: i32,
+    pub parent: i32,
+    pub sleep_start: u64,
+    pub sleep_end: u64,
+    pub runtime_ns: u64,
+    pub yield_cnt: u32,
+    pub runnable_stop_cnt: u32,
+    pub stop_cnt: u32
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskStats {
     // Runtime statistics
@@ -9,7 +21,11 @@ pub struct TaskStats {
     sleep_sum_sq: f64,
     sleep_count: u64,  // Number of events with sleep (used internally for avg/cv)
 
-    event_count: u64,
+    runnable_stop_cnt: u64,
+    yield_cnt: u64,
+    stop_cnt: u64,
+
+    pub event_count: u64,
     parent: i32,
     pub exit: u8,
 }
@@ -24,18 +40,27 @@ impl TaskStats {
             sleep_sum_sq: 0.0,
             sleep_count: 0,
 
+            runnable_stop_cnt: 0,
+            yield_cnt: 0,
+            stop_cnt: 0,
+
             event_count: 0,
             parent,
             exit: 0,
         }
     }
 
-    pub fn update(&mut self, runtime_ns: u64, sleep_ns: u64, _sleep_end: u64) {
+    pub fn update(&mut self, event: &TaskEvent) {
+        let sleep_ns = if event.sleep_end > event.sleep_start {
+            event.sleep_end - event.sleep_start
+        } else {
+            0
+        };
         self.event_count += 1;
 
         // Update runtime statistics
-        self.runtime_sum += runtime_ns;
-        self.runtime_sum_sq += (runtime_ns as f64) * (runtime_ns as f64);
+        self.runtime_sum += event.runtime_ns;
+        self.runtime_sum_sq += (event.runtime_ns as f64) * (event.runtime_ns as f64);
 
         // Update sleep statistics
         if sleep_ns > 0 {
@@ -43,6 +68,10 @@ impl TaskStats {
             self.sleep_sum += sleep_ns;
             self.sleep_sum_sq += (sleep_ns as f64) * (sleep_ns as f64);
         }
+        self.yield_cnt += event.yield_cnt as u64;
+        //self.non_voluntary += (event.runnable_stop_cnt - event.yield_cnt) as u64;
+        self.runnable_stop_cnt += event.runnable_stop_cnt as u64;
+        self.stop_cnt += event.stop_cnt as u64;
     }
 
     fn avg_runtime_ms(&self) -> f64 {
@@ -97,11 +126,12 @@ impl TaskStats {
     /// The order here defines the CSV column order and feature vector order.
     pub fn get_named_stats(&self) -> Vec<(&'static str, f64)> {
         vec![
-            ("event_count", self.event_count as f64),
-            ("avg_runtime_ms", self.avg_runtime_ms()),
             ("runtime_cv", self.runtime_cv()),
             ("avg_sleep_ms", self.avg_sleep_ms()),
             ("sleep_cv", self.sleep_cv()),
+            ("yield_ratio", (self.yield_cnt as f64) / (self.stop_cnt as f64)),
+            ("sleep_ratio", (self.sleep_count as f64) / (self.stop_cnt as f64)),
+            ("runnable_stop_ratio", (self.runnable_stop_cnt as f64) / (self.stop_cnt as f64))
         ]
     }
 

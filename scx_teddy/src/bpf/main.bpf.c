@@ -55,6 +55,9 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_start = target_ctx->sleep_start;
     e->sleep_end = target_ctx->sleep_end;
     e->runtime_ns = target_ctx->runtime_ns;
+    e->runnable_stop_cnt = target_ctx->runnable_stop_cnt;
+    e->yield_cnt = target_ctx->yield_cnt;
+    e->stop_cnt = target_ctx->stop_cnt;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -63,6 +66,9 @@ clear_tracing_data:
     // Clear tracing data
     target_ctx->runtime_ns = 0;
     target_ctx->sleep_end = 0;
+    target_ctx->runnable_stop_cnt = 0;
+    target_ctx->yield_cnt = 0;
+    target_ctx->stop_cnt = 0;
 }
 
 static target_ctx_t *get_target_storage(struct task_struct *p)
@@ -193,13 +199,17 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (!target_ctx)
         return;
     target_ctx->runtime_ns += now - target_ctx->start_running;
+    target_ctx->stop_cnt++;
 
     if (!runnable) {
         if (target_ctx->sleep_start != 0)
             data_to_user(p, target_ctx);
         target_ctx->sleep_start = now;
-    } else if (target_ctx->runtime_ns >= 1000000000)
-        data_to_user(p, target_ctx);
+    } else {
+        target_ctx->runnable_stop_cnt++;
+        if (target_ctx->runtime_ns >= 1000000000)
+            data_to_user(p, target_ctx);
+    }
 
     s32 key = p->pid;
     sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
@@ -235,6 +245,15 @@ submit_ringbuf:
 clear_tracing_data:
 }
 
+bool BPF_STRUCT_OPS(teddy_yield, struct task_struct *from, struct task_struct *to)
+{
+    target_ctx_t *target_ctx = get_target_storage(from);
+    if (!target_ctx)
+        return false;
+    target_ctx->yield_cnt++;
+    return false;
+}
+
 /* Scheduler exit - record exit info */
 void BPF_STRUCT_OPS(teddy_exit, struct scx_exit_info *ei)
 {
@@ -249,6 +268,7 @@ SCX_OPS_DEFINE(teddy_ops,
                .runnable       = (void *)teddy_runnable,
                .running        = (void *)teddy_running,
                .stopping       = (void *)teddy_stopping,
+               .yield          = (bool *)teddy_yield,
                .exit_task      = (void *)teddy_exit_task,
                .init           = (void *)teddy_init,
                .exit           = (void *)teddy_exit,

@@ -22,6 +22,7 @@ mod classifier;
 mod task_stats;
 
 use task_stats::TaskStats;
+use crate::task_stats::TaskEvent;
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -114,33 +115,18 @@ struct Args {
     config: Option<String>,
 }
 
-#[repr(C)]
-struct TaskEvent {
-    tid: i32,
-    parent: i32,
-    sleep_start: u64,
-    sleep_end: u64,
-    runtime_ns: u64
-}
-
 unsafe impl Plain for TaskEvent {}
 
 // Process event received from ring buffer
 fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, TaskStats>>>) -> i32 {
     let event = plain::from_bytes::<TaskEvent>(data).unwrap();
 
-    let sleep_duration = if event.sleep_end > event.sleep_start {
-        event.sleep_end - event.sleep_start
-    } else {
-        0
-    };
-
     // Update statistics
     let mut stats = stats.lock().unwrap();
 
     if event.parent > 0 {
         let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
-        task_stats.update(event.runtime_ns, sleep_duration, event.sleep_end);
+        task_stats.update(event);
     } else if event.parent == -1 {
         if let Some(task_stats) = stats.get_mut(&event.tid) {
             task_stats.exit = 1;
@@ -250,14 +236,11 @@ fn main() -> Result<()> {
                 let update_map = &skel.maps.update_map;
 
                 for (&tid, task_stats) in stats_map.iter() {
-                    if task_stats.exit != 0 {
+                    if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
                     }
                     let named_stats = task_stats.get_named_stats();
                     let features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
-                    if (features[0] as u64) < args.min_events {
-                        continue;
-                    }
                     let cluster = classifier.predict(&features);
                     cluster_tids[cluster].push(tid);
 
@@ -302,14 +285,10 @@ fn main() -> Result<()> {
 
                 let mut count = 0u64;
                 for (&tid, task_stats) in stats_map.iter() {
-                    if task_stats.exit != 0 {
+                    if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
                     }
                     let stats_arr = task_stats.get_stats();
-                    if (stats_arr[0] as u64) < args.min_events {
-                        println!("{} too few data", tid);
-                        continue;
-                    }
                     let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
                     writeln!(file, "{},{}", tid, values.join(","))
                         .context("Failed to write CSV row")?;

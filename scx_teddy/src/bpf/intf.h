@@ -47,14 +47,20 @@ typedef struct target_ctx {
     u64 start_running;
     u64 sleep_start;
     u64 sleep_end;
+    u32 yield_cnt; // 1 ns add 1 still not overflow
+    u32 runnable_stop_cnt;
+    u32 stop_cnt;
 } target_ctx_t;
 
 typedef struct task_event {
-    int tid;  // Thread ID (statistics are per-TID)
-    int parent;
-    unsigned long long sleep_start;
-    unsigned long long sleep_end;
-    unsigned long long runtime_ns;
+    s32 tid;  // Thread ID (statistics are per-TID)
+    s32 parent;
+    u64 sleep_start;
+    u64 sleep_end;
+    u64 runtime_ns;
+    u32 yield_cnt;
+    u32 runnable_stop_cnt;
+    u32 stop_cnt;
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0
