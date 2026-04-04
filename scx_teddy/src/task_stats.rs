@@ -7,7 +7,8 @@ pub struct TaskEvent {
     pub runtime_ns: u64,
     pub yield_cnt: u32,
     pub runnable_stop_cnt: u32,
-    pub stop_cnt: u32
+    pub stop_cnt: u32,
+    pub in_iowait_cnt: u32
 }
 
 #[derive(Debug, Clone, Default)]
@@ -24,6 +25,7 @@ pub struct TaskStats {
     runnable_stop_cnt: u64,
     yield_cnt: u64,
     stop_cnt: u64,
+    in_iowait_cnt: u64,
 
     pub event_count: u64,
     parent: i32,
@@ -43,6 +45,7 @@ impl TaskStats {
             runnable_stop_cnt: 0,
             yield_cnt: 0,
             stop_cnt: 0,
+            in_iowait_cnt: 0,
 
             event_count: 0,
             parent,
@@ -69,9 +72,9 @@ impl TaskStats {
             self.sleep_sum_sq += (sleep_ns as f64) * (sleep_ns as f64);
         }
         self.yield_cnt += event.yield_cnt as u64;
-        //self.non_voluntary += (event.runnable_stop_cnt - event.yield_cnt) as u64;
         self.runnable_stop_cnt += event.runnable_stop_cnt as u64;
         self.stop_cnt += event.stop_cnt as u64;
+        self.in_iowait_cnt += event.in_iowait_cnt as u64;
     }
 
     fn avg_runtime_ms(&self) -> f64 {
@@ -131,6 +134,7 @@ impl TaskStats {
             ("sleep_cv", self.sleep_cv()),
             ("yield_ratio", (self.yield_cnt as f64) / (self.stop_cnt as f64)),
             ("sleep_ratio", (self.sleep_count as f64) / (self.stop_cnt as f64)),
+            ("iowait_ratio", (self.in_iowait_cnt as f64) / (self.stop_cnt as f64)),
             ("runnable_stop_ratio", (self.runnable_stop_cnt as f64) / (self.stop_cnt as f64))
         ]
     }

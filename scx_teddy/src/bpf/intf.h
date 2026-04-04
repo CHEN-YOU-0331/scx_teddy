@@ -50,6 +50,7 @@ typedef struct target_ctx {
     u32 yield_cnt; // 1 ns add 1 still not overflow
     u32 runnable_stop_cnt;
     u32 stop_cnt;
+    u32 in_iowait_cnt;
 } target_ctx_t;
 
 typedef struct task_event {
@@ -61,6 +62,7 @@ typedef struct task_event {
     u32 yield_cnt;
     u32 runnable_stop_cnt;
     u32 stop_cnt;
+    u32 in_iowait_cnt;
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0

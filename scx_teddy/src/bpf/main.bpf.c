@@ -58,6 +58,7 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->runnable_stop_cnt = target_ctx->runnable_stop_cnt;
     e->yield_cnt = target_ctx->yield_cnt;
     e->stop_cnt = target_ctx->stop_cnt;
+    e->in_iowait_cnt = target_ctx->in_iowait_cnt;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -69,6 +70,7 @@ clear_tracing_data:
     target_ctx->runnable_stop_cnt = 0;
     target_ctx->yield_cnt = 0;
     target_ctx->stop_cnt = 0;
+    target_ctx->in_iowait_cnt = 0;
 }
 
 static target_ctx_t *get_target_storage(struct task_struct *p)
@@ -200,6 +202,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         return;
     target_ctx->runtime_ns += now - target_ctx->start_running;
     target_ctx->stop_cnt++;
+    target_ctx->in_iowait_cnt += p->in_iowait;
 
     if (!runnable) {
         if (target_ctx->sleep_start != 0)
