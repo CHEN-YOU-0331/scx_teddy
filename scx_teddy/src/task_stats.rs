@@ -2,8 +2,11 @@
 pub struct TaskEvent {
     pub tid: i32,
     pub parent: i32,
-    pub sleep_ns: u64,
-    pub runtime_ns: u64,
+    pub event_cnt: u32,
+    pub sleep_sum: u64,
+    pub sleep_sq_sum: u64,
+    pub runtime_sum: u64,
+    pub runtime_sq_sum: u64,
     pub yield_cnt: u32,
     pub runnable_stop_cnt: u32,
     pub stop_cnt: u32,
@@ -14,11 +17,11 @@ pub struct TaskEvent {
 pub struct TaskStats {
     // Runtime statistics
     runtime_sum: u64,
-    runtime_sum_sq: f64,  // Sum of squares for variance calculation
+    runtime_sq_sum: f64,  // Sum of squares for variance calculation
 
     // Sleep statistics
     sleep_sum: u64,
-    sleep_sum_sq: f64,
+    sleep_sq_sum: f64,
     sleep_count: u64,  // Number of events with sleep (used internally for avg/cv)
 
     runnable_stop_cnt: u64,
@@ -35,10 +38,10 @@ impl TaskStats {
     pub fn new(parent: i32) -> Self {
         Self {
             runtime_sum: 0,
-            runtime_sum_sq: 0.0,
+            runtime_sq_sum: 0.0,
 
             sleep_sum: 0,
-            sleep_sum_sq: 0.0,
+            sleep_sq_sum: 0.0,
             sleep_count: 0,
 
             runnable_stop_cnt: 0,
@@ -53,18 +56,17 @@ impl TaskStats {
     }
 
     pub fn update(&mut self, event: &TaskEvent) {
-        self.event_count += 1;
+        self.event_count += event.event_cnt as u64;
 
         // Update runtime statistics
-        self.runtime_sum += event.runtime_ns;
-        self.runtime_sum_sq += (event.runtime_ns as f64) * (event.runtime_ns as f64);
+        self.runtime_sum += event.runtime_sum;
+        self.runtime_sq_sum += event.runtime_sq_sum as f64;
 
         // Update sleep statistics
-        if event.sleep_ns > 0 {
-            self.sleep_count += 1;
-            self.sleep_sum += event.sleep_ns;
-            self.sleep_sum_sq += (event.sleep_ns as f64) * (event.sleep_ns as f64);
-        }
+        self.sleep_count += (event.stop_cnt - event.runnable_stop_cnt) as u64;
+        self.sleep_sum += event.sleep_sum;
+        self.sleep_sq_sum += event.sleep_sq_sum as f64;
+        
         self.yield_cnt += event.yield_cnt as u64;
         self.runnable_stop_cnt += event.runnable_stop_cnt as u64;
         self.stop_cnt += event.stop_cnt as u64;
@@ -82,7 +84,7 @@ impl TaskStats {
     fn stddev_runtime_ms(&self) -> f64 {
         if self.event_count > 1 {
             let mean = self.runtime_sum as f64 / self.event_count as f64;
-            let variance = (self.runtime_sum_sq / self.event_count as f64) - (mean * mean);
+            let variance = (self.runtime_sq_sum / self.event_count as f64) - (mean * mean);
             (variance.max(0.0).sqrt()) / 1_000_000.0
         } else {
             0.0
@@ -106,7 +108,7 @@ impl TaskStats {
     fn stddev_sleep_ms(&self) -> f64 {
         if self.sleep_count > 1 {
             let mean = self.sleep_sum as f64 / self.sleep_count as f64;
-            let variance = (self.sleep_sum_sq / self.sleep_count as f64) - (mean * mean);
+            let variance = (self.sleep_sq_sum / self.sleep_count as f64) - (mean * mean);
             (variance.max(0.0).sqrt()) / 1_000_000.0
         } else {
             0.0

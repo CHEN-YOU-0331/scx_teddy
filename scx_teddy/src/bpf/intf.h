@@ -43,10 +43,16 @@ typedef struct target_ctx {
     u64 slice; // ns
     u8 config;
     /* | 7 bits NOP | 1 bits ecore |*/
-    u64 runtime_ns;
     u64 start_running;
     u64 sleep_start;
     u64 sleep_end;
+    u64 runtime_ns;
+
+    u32 event_cnt;
+    u64 sleep_sum; // use 1e-6 sec
+    u64 sleep_sq_sum;
+    u64 runtime_sum;
+    u64 runtime_sq_sum;
     u32 yield_cnt; // 1 ns add 1 still not overflow
     u32 runnable_stop_cnt;
     u32 stop_cnt;
@@ -56,8 +62,11 @@ typedef struct target_ctx {
 typedef struct task_event {
     s32 tid;  // Thread ID (statistics are per-TID)
     s32 parent;
-    u64 sleep_ns;
-    u64 runtime_ns;
+    u32 event_cnt;
+    u64 sleep_sum; // use 1e-6 sec
+    u64 sleep_sq_sum;
+    u64 runtime_sum;
+    u64 runtime_sq_sum;
     u32 yield_cnt;
     u32 runnable_stop_cnt;
     u32 stop_cnt;
@@ -65,3 +74,5 @@ typedef struct task_event {
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0
+
+#define RUNTIME_MAX_TIME 1000000000

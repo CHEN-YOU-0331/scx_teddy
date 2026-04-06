@@ -40,10 +40,12 @@ struct {
 static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
-    u32 *stop_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
+    u32 *pause_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
 
-    if (*stop_ringbuf)
-        goto clear_tracing_data;
+    if (*pause_ringbuf) {
+        return; // don't clear the data
+    }
+        
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
     if (!e)
@@ -52,12 +54,11 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     // Fill event data
     e->tid = p->pid;
     e->parent = p->real_parent->pid;
-    if (target_ctx->sleep_end > target_ctx->sleep_start) 
-        e->sleep_ns = target_ctx->sleep_end - target_ctx->sleep_start;
-    else
-        e->sleep_ns = 0;
-        
-    e->runtime_ns = target_ctx->runtime_ns;
+    e->event_cnt = target_ctx->event_cnt;
+    e->sleep_sum = target_ctx->sleep_sum;
+    e->sleep_sq_sum = target_ctx->sleep_sq_sum;
+    e->runtime_sum = target_ctx->runtime_sum;
+    e->runtime_sq_sum = target_ctx->runtime_sq_sum;
     e->runnable_stop_cnt = target_ctx->runnable_stop_cnt;
     e->yield_cnt = target_ctx->yield_cnt;
     e->stop_cnt = target_ctx->stop_cnt;
@@ -66,10 +67,11 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
 
-clear_tracing_data:
-    // Clear tracing data
-    target_ctx->runtime_ns = 0;
-    target_ctx->sleep_end = 0;
+    target_ctx->event_cnt = 0;
+    target_ctx->sleep_sum = 0;
+    target_ctx->sleep_sq_sum = 0;
+    target_ctx->runtime_sum = 0;
+    target_ctx->runtime_sq_sum = 0;
     target_ctx->runnable_stop_cnt = 0;
     target_ctx->yield_cnt = 0;
     target_ctx->stop_cnt = 0;
@@ -197,6 +199,27 @@ void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
     target_ctx->start_running = scx_bpf_now();
 }
 
+static void update_event_data(target_ctx_t *target_ctx)
+{
+    target_ctx->event_cnt++;
+    u64 sleep_mus;
+    if (target_ctx->sleep_end > target_ctx->sleep_start) 
+        sleep_mus = target_ctx->sleep_end - target_ctx->sleep_start;
+    else
+        sleep_mus = 0;
+    if (sleep_mus > (1 << 31)) 
+        sleep_mus = 1 << 31;
+    target_ctx->sleep_sum += sleep_mus;
+    target_ctx->sleep_sq_sum += sleep_mus * sleep_mus;
+
+    // runtime have upper bound 1e9, won't overflow directly
+    target_ctx->runtime_sum += target_ctx->runtime_ns;
+    target_ctx->runtime_sq_sum += target_ctx->runtime_ns * target_ctx->runtime_ns;
+
+    target_ctx->runtime_ns = 0;
+    target_ctx->sleep_end = 0;
+}
+
 void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
 {
     u64 now = scx_bpf_now();
@@ -208,13 +231,17 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     target_ctx->in_iowait_cnt += p->in_iowait;
 
     if (!runnable) {
-        if (target_ctx->sleep_start != 0)
+        if (target_ctx->sleep_start != 0) {
+            update_event_data(target_ctx);
             data_to_user(p, target_ctx);
+        }
         target_ctx->sleep_start = now;
     } else {
         target_ctx->runnable_stop_cnt++;
-        if (target_ctx->runtime_ns >= 1000000000)
+        if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
+            update_event_data(target_ctx);
             data_to_user(p, target_ctx);
+        }
     }
 
     s32 key = p->pid;
@@ -230,9 +257,9 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
     u32 key = CONFIG_STOP_RINGBUF;
-    u32 *stop_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
+    u32 *pause_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
 
-    if (*stop_ringbuf)
+    if (*pause_ringbuf)
         goto clear_tracing_data;
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
@@ -241,11 +268,7 @@ void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task
 
     e->tid = p->pid;
     e->parent = -1;
-    e->sleep_ns = 0;
-    e->runtime_ns = 0;
 
-submit_ringbuf:
-    // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
 clear_tracing_data:
 }
