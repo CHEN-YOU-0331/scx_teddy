@@ -212,7 +212,7 @@ static void update_event_data(target_ctx_t *target_ctx)
     target_ctx->sleep_sum += sleep_mus;
     target_ctx->sleep_sq_sum += sleep_mus * sleep_mus;
 
-    // runtime have upper bound 1e9, won't overflow directly
+    // runtime have upper bound RUNTIME_MAX_TIME, won't overflow directly
     target_ctx->runtime_sum += target_ctx->runtime_ns;
     target_ctx->runtime_sq_sum += target_ctx->runtime_ns * target_ctx->runtime_ns;
 

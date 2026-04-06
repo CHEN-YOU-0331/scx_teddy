@@ -75,4 +75,4 @@ typedef struct task_event {
 
 #define CONFIG_STOP_RINGBUF 0
 
-#define RUNTIME_MAX_TIME 1000000000
+#define RUNTIME_MAX_TIME 100000000
