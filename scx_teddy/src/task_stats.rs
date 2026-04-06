@@ -2,8 +2,7 @@
 pub struct TaskEvent {
     pub tid: i32,
     pub parent: i32,
-    pub sleep_start: u64,
-    pub sleep_end: u64,
+    pub sleep_ns: u64,
     pub runtime_ns: u64,
     pub yield_cnt: u32,
     pub runnable_stop_cnt: u32,
@@ -54,11 +53,6 @@ impl TaskStats {
     }
 
     pub fn update(&mut self, event: &TaskEvent) {
-        let sleep_ns = if event.sleep_end > event.sleep_start {
-            event.sleep_end - event.sleep_start
-        } else {
-            0
-        };
         self.event_count += 1;
 
         // Update runtime statistics
@@ -66,10 +60,10 @@ impl TaskStats {
         self.runtime_sum_sq += (event.runtime_ns as f64) * (event.runtime_ns as f64);
 
         // Update sleep statistics
-        if sleep_ns > 0 {
+        if event.sleep_ns > 0 {
             self.sleep_count += 1;
-            self.sleep_sum += sleep_ns;
-            self.sleep_sum_sq += (sleep_ns as f64) * (sleep_ns as f64);
+            self.sleep_sum += event.sleep_ns;
+            self.sleep_sum_sq += (event.sleep_ns as f64) * (event.sleep_ns as f64);
         }
         self.yield_cnt += event.yield_cnt as u64;
         self.runnable_stop_cnt += event.runnable_stop_cnt as u64;

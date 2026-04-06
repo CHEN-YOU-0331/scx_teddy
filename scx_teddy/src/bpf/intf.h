@@ -56,8 +56,7 @@ typedef struct target_ctx {
 typedef struct task_event {
     s32 tid;  // Thread ID (statistics are per-TID)
     s32 parent;
-    u64 sleep_start;
-    u64 sleep_end;
+    u64 sleep_ns;
     u64 runtime_ns;
     u32 yield_cnt;
     u32 runnable_stop_cnt;

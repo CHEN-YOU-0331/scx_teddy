@@ -52,8 +52,11 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     // Fill event data
     e->tid = p->pid;
     e->parent = p->real_parent->pid;
-    e->sleep_start = target_ctx->sleep_start;
-    e->sleep_end = target_ctx->sleep_end;
+    if (target_ctx->sleep_end > target_ctx->sleep_start) 
+        e->sleep_ns = target_ctx->sleep_end - target_ctx->sleep_start;
+    else
+        e->sleep_ns = 0;
+        
     e->runtime_ns = target_ctx->runtime_ns;
     e->runnable_stop_cnt = target_ctx->runnable_stop_cnt;
     e->yield_cnt = target_ctx->yield_cnt;
@@ -238,8 +241,7 @@ void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task
 
     e->tid = p->pid;
     e->parent = -1;
-    e->sleep_start = 0;
-    e->sleep_end = 0;
+    e->sleep_ns = 0;
     e->runtime_ns = 0;
 
 submit_ringbuf:
