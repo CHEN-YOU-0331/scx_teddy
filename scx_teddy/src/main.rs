@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::io::BufRead;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,7 +100,7 @@ struct Args {
     mode: String,
 
     /// Minimum event count to include a task in event.csv (filter inactive tasks)
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 2)]
     min_events: u64,
 
     /// Output CSV file path (collect mode)
@@ -271,33 +272,62 @@ fn main() -> Result<()> {
                 }
             } else {
                 // Collect mode: write stats to CSV
-                let file_exists = std::path::Path::new(&args.output).exists();
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&args.output)
-                    .context("Failed to open output CSV")?;
+                // Read existing CSV rows into an ordered map (tid -> row string)
+                let mut existing_rows: Vec<(i32, String)> = Vec::new();
+                let mut existing_tids: HashMap<i32, usize> = HashMap::new();
 
-                if !file_exists {
-                    writeln!(file, "{}", csv_header())
-                        .context("Failed to write CSV header")?;
+                if std::path::Path::new(&args.output).exists() {
+                    let reader = std::io::BufReader::new(
+                        std::fs::File::open(&args.output)
+                            .context("Failed to open existing CSV for reading")?
+                    );
+                    for (i, line) in reader.lines().enumerate() {
+                        let line = line.context("Failed to read CSV line")?;
+                        if i == 0 {
+                            continue; // skip header
+                        }
+                        if let Some(tid_str) = line.split(',').next() {
+                            if let Ok(tid) = tid_str.trim().parse::<i32>() {
+                                existing_tids.insert(tid, existing_rows.len());
+                                existing_rows.push((tid, line));
+                            }
+                        }
+                    }
                 }
 
-                let mut count = 0u64;
+                let mut new_count = 0u64;
+                let mut update_count = 0u64;
                 for (&tid, task_stats) in stats_map.iter() {
                     if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
                     }
                     let stats_arr = task_stats.get_stats();
                     let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
-                    writeln!(file, "{},{}", tid, values.join(","))
-                        .context("Failed to write CSV row")?;
-                    count += 1;
+                    let row = format!("{},{}", tid, values.join(","));
+
+                    if let Some(&idx) = existing_tids.get(&tid) {
+                        existing_rows[idx].1 = row;
+                        update_count += 1;
+                    } else {
+                        existing_tids.insert(tid, existing_rows.len());
+                        existing_rows.push((tid, row));
+                        new_count += 1;
+                    }
                 }
-                println!("Wrote {} tasks to {}", count, args.output);
+
+                // Write everything back
+                let mut file = std::fs::File::create(&args.output)
+                    .context("Failed to create output CSV")?;
+                writeln!(file, "{}", csv_header())
+                    .context("Failed to write CSV header")?;
+                for (_, row) in &existing_rows {
+                    writeln!(file, "{}", row)
+                        .context("Failed to write CSV row")?;
+                }
+                println!("CSV updated: {} new, {} updated, {} total rows",
+                    new_count, update_count, existing_rows.len());
             }
 
-            stats_map.clear();
             start_time = Instant::now();
             val = 0u32.to_ne_bytes();
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
