@@ -10,10 +10,13 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
+# Columns that are metadata, not features for training
+META_COLUMNS = {"tid", "tgid", "ppid", "comm"}
+
 
 def get_feature_columns(df):
-    """Derive feature columns from the DataFrame (all columns except 'tid')."""
-    return [col for col in df.columns if col != "tid"]
+    """Derive feature columns from the DataFrame (all columns except metadata)."""
+    return [col for col in df.columns if col not in META_COLUMNS]
 
 
 def find_best_k(X_scaled, k_range=range(2, 11)):
@@ -39,7 +42,6 @@ def train(csv_path, output_path, n_clusters=None):
 
     feature_columns = get_feature_columns(df)
     X = df[feature_columns].values
-    tids = df["tid"].values
 
     # Standardize
     scaler = StandardScaler()
@@ -84,7 +86,8 @@ def train(csv_path, output_path, n_clusters=None):
         print(f"\n--- Cluster {c} ({mask.sum()} tasks) ---")
         print(cluster_df[feature_columns].describe().to_string())
 
-    # Build cluster membership with tgid from /proc
+    # Build cluster membership from CSV metadata columns
+    has_meta = "tgid" in df.columns
     print(f"\n{'='*60}")
     print("Cluster membership (tid, tgid, command)")
     print(f"{'='*60}")
@@ -93,16 +96,14 @@ def train(csv_path, output_path, n_clusters=None):
     for c in range(n_clusters):
         mask = labels == c
         members = []
-        for tid in tids[mask]:
-            tgid = read_proc_field(tid, "Tgid")
-            ppid = read_proc_field(tid, "PPid")
-            comm = read_proc_comm(tid)
-            members.append({
-                "tid": int(tid),
-                "tgid": tgid,
-                "ppid": ppid,
-                "command": comm,
-            })
+        for idx in np.where(mask)[0]:
+            row = df.iloc[idx]
+            member = {"tid": int(row["tid"])}
+            if has_meta:
+                member["tgid"] = int(row["tgid"]) if pd.notna(row.get("tgid")) else None
+                member["ppid"] = int(row["ppid"]) if pd.notna(row.get("ppid")) else None
+                member["command"] = row.get("comm", None)
+            members.append(member)
         clusters[f"cluster_{c}"] = members
 
     # Print
@@ -110,34 +111,16 @@ def train(csv_path, output_path, n_clusters=None):
         key = f"cluster_{c}"
         print(f"\n--- {key} ---")
         for m in clusters[key]:
-            print(f"  tid={m['tid']}, tgid={m['tgid']}, ppid={m['ppid']}, cmd={m['command']}")
+            if has_meta:
+                print(f"  tid={m['tid']}, tgid={m.get('tgid')}, ppid={m.get('ppid')}, cmd={m.get('command')}")
+            else:
+                print(f"  tid={m['tid']}")
 
     # Save classification result
     result_path = output_path.replace(".json", "_result.json")
     with open(result_path, "w") as f:
         json.dump(clusters, f, indent=2)
     print(f"\nClassification result saved to {result_path}")
-
-
-def read_proc_field(tid, field):
-    """Read a field from /proc/<tid>/status."""
-    try:
-        with open(f"/proc/{tid}/status") as f:
-            for line in f:
-                if line.startswith(f"{field}:"):
-                    return int(line.split(":")[1].strip())
-    except (FileNotFoundError, ValueError, PermissionError):
-        pass
-    return None
-
-
-def read_proc_comm(tid):
-    """Read command name from /proc/<tid>/comm."""
-    try:
-        with open(f"/proc/{tid}/comm") as f:
-            return f.read().strip()
-    except (FileNotFoundError, PermissionError):
-        return None
 
 
 def main():
@@ -153,19 +136,21 @@ def main():
 
     df = pd.read_csv(args.csv)
 
-    # Apply filters before training
+    # Apply filters using CSV metadata columns (no /proc access needed)
     if args.filter_tid:
         df = df[df["tid"].isin(args.filter_tid)]
         print(f"Filtered to {len(df)} tasks by tid")
     if args.filter_tgid:
-        tgid_set = set(args.filter_tgid)
-        keep = [read_proc_field(tid, "Tgid") in tgid_set for tid in df["tid"]]
-        df = df[keep]
+        if "tgid" not in df.columns:
+            print("Error: CSV does not contain 'tgid' column. Re-collect data with updated scx_teddy.", file=sys.stderr)
+            sys.exit(1)
+        df = df[df["tgid"].isin(args.filter_tgid)]
         print(f"Filtered to {len(df)} tasks by tgid")
     if args.filter_cmd:
-        cmd_set = set(args.filter_cmd)
-        keep = [read_proc_comm(tid) in cmd_set for tid in df["tid"]]
-        df = df[keep]
+        if "comm" not in df.columns:
+            print("Error: CSV does not contain 'comm' column. Re-collect data with updated scx_teddy.", file=sys.stderr)
+            sys.exit(1)
+        df = df[df["comm"].isin(args.filter_cmd)]
         print(f"Filtered to {len(df)} tasks by command")
 
     if len(df) == 0:

@@ -139,12 +139,34 @@ fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, T
 
 fn csv_header() -> String {
     let feature_names = TaskStats::get_feature_names();
-    let mut header = String::from("tid");
+    let mut header = String::from("tid,tgid,ppid,comm");
     for name in &feature_names {
         header.push(',');
         header.push_str(name);
     }
     header
+}
+
+/// Read a field (e.g. "Tgid", "PPid") from /proc/<tid>/status.
+fn read_proc_field(tid: i32, field: &str) -> Option<i32> {
+    let path = format!("/proc/{}/status", tid);
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            if let Some(val) = rest.strip_prefix(':') {
+                return val.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Read command name from /proc/<tid>/comm.
+fn read_proc_comm(tid: i32) -> String {
+    let path = format!("/proc/{}/comm", tid);
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn main() -> Result<()> {
@@ -301,9 +323,14 @@ fn main() -> Result<()> {
                     if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
                     }
+                    let tgid = read_proc_field(tid, "Tgid")
+                        .map(|v| v.to_string()).unwrap_or_default();
+                    let ppid = read_proc_field(tid, "PPid")
+                        .map(|v| v.to_string()).unwrap_or_default();
+                    let comm = read_proc_comm(tid);
                     let stats_arr = task_stats.get_stats();
                     let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
-                    let row = format!("{},{}", tid, values.join(","));
+                    let row = format!("{},{},{},{},{}", tid, tgid, ppid, comm, values.join(","));
 
                     if let Some(&idx) = existing_tids.get(&tid) {
                         existing_rows[idx].1 = row;
