@@ -99,7 +99,7 @@ impl TaskStats {
 
     fn avg_sleep_ms(&self) -> f64 {
         if self.sleep_count > 0 {
-            (self.sleep_sum as f64 / self.sleep_count as f64) / 1_000_000.0
+            (self.sleep_sum as f64 / self.sleep_count as f64) / 1_000.0
         } else {
             0.0
         }
@@ -109,7 +109,7 @@ impl TaskStats {
         if self.sleep_count > 1 {
             let mean = self.sleep_sum as f64 / self.sleep_count as f64;
             let variance = (self.sleep_sq_sum / self.sleep_count as f64) - (mean * mean);
-            (variance.max(0.0).sqrt()) / 1_000_000.0
+            (variance.max(0.0).sqrt()) / 1_000.0
         } else {
             0.0
         }

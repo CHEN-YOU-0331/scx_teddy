@@ -204,11 +204,11 @@ static void update_event_data(target_ctx_t *target_ctx)
     target_ctx->event_cnt++;
     u64 sleep_mus;
     if (target_ctx->sleep_end > target_ctx->sleep_start) 
-        sleep_mus = target_ctx->sleep_end - target_ctx->sleep_start;
+        sleep_mus = (target_ctx->sleep_end - target_ctx->sleep_start) >> 10;
     else
         sleep_mus = 0;
-    if (sleep_mus > (1 << 31)) 
-        sleep_mus = 1 << 31;
+    if (sleep_mus > (1ULL << 31)) 
+        sleep_mus = 1ULL << 31;
     target_ctx->sleep_sum += sleep_mus;
     target_ctx->sleep_sq_sum += sleep_mus * sleep_mus;
 
