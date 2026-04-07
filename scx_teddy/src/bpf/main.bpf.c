@@ -59,9 +59,8 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_sq_sum = target_ctx->sleep_sq_sum;
     e->runtime_sum = target_ctx->runtime_sum;
     e->runtime_sq_sum = target_ctx->runtime_sq_sum;
-    e->runnable_stop_cnt = target_ctx->runnable_stop_cnt;
+    e->sleep_cnt = target_ctx->sleep_cnt;
     e->yield_cnt = target_ctx->yield_cnt;
-    e->stop_cnt = target_ctx->stop_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
 
     // Submit to ring buffer
@@ -72,9 +71,8 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     target_ctx->sleep_sq_sum = 0;
     target_ctx->runtime_sum = 0;
     target_ctx->runtime_sq_sum = 0;
-    target_ctx->runnable_stop_cnt = 0;
+    target_ctx->sleep_cnt = 0;
     target_ctx->yield_cnt = 0;
-    target_ctx->stop_cnt = 0;
     target_ctx->in_iowait_cnt = 0;
 }
 
@@ -227,17 +225,16 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (!target_ctx)
         return;
     target_ctx->runtime_ns += now - target_ctx->start_running;
-    target_ctx->stop_cnt++;
     target_ctx->in_iowait_cnt += p->in_iowait;
 
     if (!runnable) {
+        target_ctx->sleep_cnt++;
         if (target_ctx->sleep_start != 0) {
             update_event_data(target_ctx);
             data_to_user(p, target_ctx);
         }
         target_ctx->sleep_start = now;
     } else {
-        target_ctx->runnable_stop_cnt++;
         if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
             update_event_data(target_ctx);
             data_to_user(p, target_ctx);

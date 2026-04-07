@@ -8,8 +8,7 @@ pub struct TaskEvent {
     pub runtime_sum: u64,
     pub runtime_sq_sum: u64,
     pub yield_cnt: u32,
-    pub runnable_stop_cnt: u32,
-    pub stop_cnt: u32,
+    pub sleep_cnt: u32,
     pub in_iowait_cnt: u32
 }
 
@@ -24,9 +23,7 @@ pub struct TaskStats {
     sleep_sq_sum: f64,
     sleep_count: u64,  // Number of events with sleep (used internally for avg/cv)
 
-    runnable_stop_cnt: u64,
     yield_cnt: u64,
-    stop_cnt: u64,
     in_iowait_cnt: u64,
 
     pub event_count: u64,
@@ -44,9 +41,7 @@ impl TaskStats {
             sleep_sq_sum: 0.0,
             sleep_count: 0,
 
-            runnable_stop_cnt: 0,
             yield_cnt: 0,
-            stop_cnt: 0,
             in_iowait_cnt: 0,
 
             event_count: 0,
@@ -63,13 +58,11 @@ impl TaskStats {
         self.runtime_sq_sum += event.runtime_sq_sum as f64;
 
         // Update sleep statistics
-        self.sleep_count += (event.stop_cnt - event.runnable_stop_cnt) as u64;
+        self.sleep_count += event.sleep_cnt as u64;
         self.sleep_sum += event.sleep_sum;
         self.sleep_sq_sum += event.sleep_sq_sum as f64;
         
         self.yield_cnt += event.yield_cnt as u64;
-        self.runnable_stop_cnt += event.runnable_stop_cnt as u64;
-        self.stop_cnt += event.stop_cnt as u64;
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
     }
 
@@ -121,17 +114,22 @@ impl TaskStats {
         if avg > 0.0 { self.stddev_sleep_ms() / avg } else { 0.0 }
     }
 
+    fn iowait_ratio(&self) -> f64 {
+        if (self.sleep_count == 0) {
+            return 0 as f64;
+        }
+        (self.in_iowait_cnt as f64) / (self.sleep_count as f64)
+    }
+
     /// Returns (name, value) pairs for all features.
     /// The order here defines the CSV column order and feature vector order.
     pub fn get_named_stats(&self) -> Vec<(&'static str, f64)> {
         vec![
+            ("runtime_ms", self.avg_runtime_ms()),
             ("runtime_cv", self.runtime_cv()),
             ("avg_sleep_ms", self.avg_sleep_ms()),
             ("sleep_cv", self.sleep_cv()),
-            ("yield_ratio", (self.yield_cnt as f64) / (self.stop_cnt as f64)),
-            ("sleep_ratio", (self.sleep_count as f64) / (self.stop_cnt as f64)),
-            ("iowait_ratio", (self.in_iowait_cnt as f64) / (self.stop_cnt as f64)),
-            ("runnable_stop_ratio", (self.runnable_stop_cnt as f64) / (self.stop_cnt as f64))
+            ("iowait_ratio", self.iowait_ratio()),
         ]
     }
 
