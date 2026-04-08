@@ -1,9 +1,27 @@
-gcc -o slow_timer slow_timer.c
+#!/bin/bash
 
-# 跑 12 個
+# Compile custom workloads
+gcc -o slow_timer slow_timer.c
+gcc -o random_timer random_timer.c -lm
+
+# Cleanup function: kill our background jobs on Ctrl+C / exit
+cleanup() {
+    echo ""
+    echo "Cleaning up..."
+    kill $(jobs -p) 2>/dev/null
+    wait 2>/dev/null
+    echo "All child processes terminated."
+    exit 0
+}
+trap cleanup INT TERM
+
+# Launch slow_timer x12
 for i in $(seq 12); do ./slow_timer & done
 
-# 搭配原本的 stress-ng
+# Launch random_timer x12
+for i in $(seq 12); do ./random_timer & done
+
+# stress-ng (runs in foreground, will be interrupted by Ctrl+C too)
 stress-ng \
   --cpu 12 --cpu-method fft \
   --hdd 12 --hdd-bytes 256M \
@@ -11,3 +29,6 @@ stress-ng \
   --timer 12 --timer-freq 500 \
   --pthread 12 \
   --metrics-brief
+
+# If stress-ng exits on its own (e.g. --timeout), clean up the rest
+cleanup
