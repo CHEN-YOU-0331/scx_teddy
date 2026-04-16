@@ -49,6 +49,29 @@ Use the training script to cluster tasks based on their runtime characteristics:
 python3 train.py event.csv -o model.json
 ```
 
+By default, all tasks in the CSV are used. To restrict training to specific workloads, pass a `train_config.config` file containing one comm prefix per line:
+
+```bash
+python3 train.py event.csv -o model.json --train-config train_config.config
+```
+
+A sample `train_config.config` is provided that matches the workloads in `bench_mark.sh`:
+
+```
+# stress-ng workloads
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-switc
+stress-ng-timer
+
+# custom workloads
+slow-timer
+random-timer
+fixed-mutex
+```
+
+Each line is matched by prefix against the task's `comm`. Lines starting with `#` and blank lines are ignored.
+
 This will:
 - Automatically select the number of clusters using the elbow method (or specify with `-k`)
 - Export the model (centroids + scaler) to a JSON file
@@ -58,6 +81,10 @@ This will:
 **Options:**
 - `-o, --output <PATH>` - Output model JSON path (default: `model.json`)
 - `-k, --clusters <N>` - Number of clusters (auto-detect if not specified)
+- `--train-config <PATH>` - Comm prefix filter list (default: use all tasks)
+- `--filter-tid <TID...>` - Filter by tid(s)
+- `--filter-tgid <TGID...>` - Filter by tgid(s)
+- `--filter-cmd <CMD...>` - Filter by exact command name(s)
 
 ### Step 3: Configure Scheduling Policy
 

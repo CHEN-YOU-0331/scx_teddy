@@ -49,6 +49,29 @@ sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 python3 train.py event.csv -o model.json
 ```
 
+預設會使用 CSV 中的全部任務。若要限定特定工作負載，可傳入 `train_config.config`，每行填一個 comm prefix：
+
+```bash
+python3 train.py event.csv -o model.json --train-config train_config.config
+```
+
+專案提供的 `train_config.config` 範例已預設包含 `bench_mark.sh` 的所有工作負載：
+
+```
+# stress-ng workloads
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-switc
+stress-ng-timer
+
+# custom workloads
+slow-timer
+random-timer
+fixed-mutex
+```
+
+每行以 prefix 方式比對任務的 `comm`，`#` 開頭與空白行會被忽略。
+
 這會：
 - 使用手肘法自動選擇分群數量（或以 `-k` 手動指定）
 - 將模型（中心點 + 標準化參數）匯出為 JSON 檔案
@@ -58,6 +81,10 @@ python3 train.py event.csv -o model.json
 **選項：**
 - `-o, --output <路徑>` - 模型 JSON 輸出路徑（預設：`model.json`）
 - `-k, --clusters <N>` - 分群數量（未指定則自動偵測）
+- `--train-config <路徑>` - comm prefix 篩選清單（預設：使用全部任務）
+- `--filter-tid <TID...>` - 依 tid 篩選
+- `--filter-tgid <TGID...>` - 依 tgid 篩選
+- `--filter-cmd <CMD...>` - 依精確命令名稱篩選
 
 ### 步驟三：設定排程策略
 
