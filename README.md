@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-scx_teddy operates in two modes: **collect** (gather task data) and **classify** (apply a trained model to schedule tasks).
+scx_teddy operates in three modes: **collect** (gather task data), **classify** (apply a trained model to schedule tasks), and **debug_classify** (inspect cluster assignments without affecting scheduling).
 
 ### Step 1: Collect Task Data
 
@@ -49,6 +49,29 @@ Use the training script to cluster tasks based on their runtime characteristics:
 python3 train.py event.csv -o model.json
 ```
 
+By default, all tasks in the CSV are used. To restrict training to specific workloads, pass a `train_config.config` file containing one comm prefix per line:
+
+```bash
+python3 train.py event.csv -o model.json --train-config train_config.config
+```
+
+A sample `train_config.config` is provided that matches the workloads in `bench_mark.sh`:
+
+```
+# stress-ng workloads
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-switc
+stress-ng-timer
+
+# custom workloads
+slow-timer
+random-timer
+fixed-mutex
+```
+
+Each line is matched by prefix against the task's `comm`. Lines starting with `#` and blank lines are ignored.
+
 This will:
 - Automatically select the number of clusters using the elbow method (or specify with `-k`)
 - Export the model (centroids + scaler) to a JSON file
@@ -58,6 +81,10 @@ This will:
 **Options:**
 - `-o, --output <PATH>` - Output model JSON path (default: `model.json`)
 - `-k, --clusters <N>` - Number of clusters (auto-detect if not specified)
+- `--train-config <PATH>` - Comm prefix filter list (default: use all tasks)
+- `--filter-tid <TID...>` - Filter by tid(s)
+- `--filter-tgid <TGID...>` - Filter by tgid(s)
+- `--filter-cmd <CMD...>` - Filter by exact command name(s)
 
 ### Step 3: Configure Scheduling Policy
 
@@ -90,6 +117,45 @@ sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config co
 **Additional options for classify mode:**
 - `--model <PATH>` - Path to trained model JSON (required)
 - `--config <PATH>` - Path to scheduling config JSON (required)
+- `-c, --collect-duration <SECONDS>` - Refresh interval in seconds (default: 600)
+
+### Step 5: Debug Classification (Optional)
+
+`debug_classify` mode uses the same trained model but does **not** modify time slices or priorities. Instead, it periodically clears the terminal and prints which cluster each watched task was assigned to.
+
+```bash
+sudo ./target/release/scx_teddy -m debug_classify -c 10 \
+  --model model.json --debug-config debug.config
+```
+
+Create a `debug.config` file listing the `comm` names to watch, one per line (prefix matching, `#` for comments):
+
+```
+# custom workloads
+fixed-mutex
+slow-timer
+random-timer
+
+# stress-ng workers (prefix match)
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-timer
+stress-ng-switc
+```
+
+Output format (refreshed every `--collect-duration` seconds):
+
+```
+[debug_classify]
+  fixed-mutex: [cluster3: 12]
+  stress-ng-cpu: [cluster0: 11, cluster2: 1]
+  stress-ng-timer: [cluster5: 12]
+```
+
+**Additional options for debug_classify mode:**
+- `--model <PATH>` - Path to trained model JSON (required)
+- `--debug-config <PATH>` - Path to debug config file (required)
+- `-c, --collect-duration <SECONDS>` - Refresh interval in seconds (default: 600)
 
 ---
 

@@ -16,7 +16,36 @@ META_COLUMNS = {"tid", "tgid", "ppid", "comm"}
 
 def get_feature_columns(df):
     """Derive feature columns from the DataFrame (all columns except metadata)."""
-    return [col for col in df.columns if col not in META_COLUMNS]
+    reserved = META_COLUMNS | {"label"}
+    return [col for col in df.columns if col not in reserved]
+
+
+def load_train_config(path: str) -> list[str]:
+    """Load comm prefixes from a train_config.config file.
+
+    Returns a list of prefix strings. Lines starting with '#' and blank lines
+    are ignored.
+    """
+    patterns = []
+    with open(path) as f:
+        for line in f:
+            s = line.split("#")[0].strip()
+            if s:
+                patterns.append(s)
+    return patterns
+
+
+def select_by_patterns(df: "pd.DataFrame", patterns: list[str]) -> "pd.DataFrame":
+    """Keep only rows whose comm matches any pattern (prefix match)."""
+    if "comm" not in df.columns:
+        print("Error: CSV does not contain 'comm' column.", file=sys.stderr)
+        sys.exit(1)
+    mask = df["comm"].astype(str).apply(
+        lambda c: any(c == p or c.startswith(p) for p in patterns)
+    )
+    out = df[mask].copy()
+    print(f"Selected {len(out)} tasks matching train_config patterns")
+    return out
 
 
 def find_best_k(X_scaled, k_range=range(2, 11)):
@@ -131,7 +160,11 @@ def main():
                         help="Number of clusters (auto-detect if not specified)")
     parser.add_argument("--filter-tid", type=int, nargs="*", help="Filter by tid(s)")
     parser.add_argument("--filter-tgid", type=int, nargs="*", help="Filter by tgid(s)")
-    parser.add_argument("--filter-cmd", nargs="*", help="Filter by command name(s)")
+    parser.add_argument("--filter-cmd", nargs="*",
+                        help="Filter by exact command name(s).")
+    parser.add_argument("--train-config", default=None, metavar="PATH",
+                        help="Path to train_config.config (comm prefix list). "
+                             "If not given, all tasks in the CSV are used.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -152,6 +185,12 @@ def main():
             sys.exit(1)
         df = df[df["comm"].isin(args.filter_cmd)]
         print(f"Filtered to {len(df)} tasks by command")
+    elif args.train_config:
+        patterns = load_train_config(args.train_config)
+        print(f"Loaded {len(patterns)} comm patterns from {args.train_config}: {patterns}")
+        df = select_by_patterns(df, patterns)
+    else:
+        print(f"No train_config specified — using all {len(df)} tasks in CSV")
 
     if len(df) == 0:
         print("No tasks remaining after filtering.", file=sys.stderr)

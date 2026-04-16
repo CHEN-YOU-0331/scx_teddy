@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## 使用方式
 
-scx_teddy 有兩種模式：**collect**（收集任務資料）和 **classify**（套用訓練好的模型進行排程）。
+scx_teddy 有三種模式：**collect**（收集任務資料）、**classify**（套用訓練好的模型進行排程）、以及 **debug_classify**（在不影響排程的情況下查看分群結果）。
 
 ### 步驟一：收集任務資料
 
@@ -49,6 +49,29 @@ sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 python3 train.py event.csv -o model.json
 ```
 
+預設會使用 CSV 中的全部任務。若要限定特定工作負載，可傳入 `train_config.config`，每行填一個 comm prefix：
+
+```bash
+python3 train.py event.csv -o model.json --train-config train_config.config
+```
+
+專案提供的 `train_config.config` 範例已預設包含 `bench_mark.sh` 的所有工作負載：
+
+```
+# stress-ng workloads
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-switc
+stress-ng-timer
+
+# custom workloads
+slow-timer
+random-timer
+fixed-mutex
+```
+
+每行以 prefix 方式比對任務的 `comm`，`#` 開頭與空白行會被忽略。
+
 這會：
 - 使用手肘法自動選擇分群數量（或以 `-k` 手動指定）
 - 將模型（中心點 + 標準化參數）匯出為 JSON 檔案
@@ -58,6 +81,10 @@ python3 train.py event.csv -o model.json
 **選項：**
 - `-o, --output <路徑>` - 模型 JSON 輸出路徑（預設：`model.json`）
 - `-k, --clusters <N>` - 分群數量（未指定則自動偵測）
+- `--train-config <路徑>` - comm prefix 篩選清單（預設：使用全部任務）
+- `--filter-tid <TID...>` - 依 tid 篩選
+- `--filter-tgid <TGID...>` - 依 tgid 篩選
+- `--filter-cmd <CMD...>` - 依精確命令名稱篩選
 
 ### 步驟三：設定排程策略
 
@@ -90,6 +117,45 @@ sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config co
 **分類模式額外選項：**
 - `--model <路徑>` - 訓練好的模型 JSON 路徑（必填）
 - `--config <路徑>` - 排程設定 JSON 路徑（必填）
+- `-c, --collect-duration <秒數>` - 刷新間隔，單位為秒（預設：600）
+
+### 步驟五：除錯分類模式（選用）
+
+`debug_classify` 模式使用相同的訓練模型，但**不會**修改時間片或優先權。每隔一段時間會清空終端機並印出被監看任務目前被分到哪個 cluster。
+
+```bash
+sudo ./target/release/scx_teddy -m debug_classify -c 10 \
+  --model model.json --debug-config debug.config
+```
+
+建立 `debug.config` 檔案，列出要監看的 `comm` 名稱，每行一個（prefix 比對，`#` 為註解）：
+
+```
+# custom workloads
+fixed-mutex
+slow-timer
+random-timer
+
+# stress-ng workers（prefix 比對）
+stress-ng-cpu
+stress-ng-hdd
+stress-ng-timer
+stress-ng-switc
+```
+
+輸出格式（每隔 `--collect-duration` 秒刷新一次）：
+
+```
+[debug_classify]
+  fixed-mutex: [cluster3: 12]
+  stress-ng-cpu: [cluster0: 11, cluster2: 1]
+  stress-ng-timer: [cluster5: 12]
+```
+
+**debug_classify 模式額外選項：**
+- `--model <路徑>` - 訓練好的模型 JSON 路徑（必填）
+- `--debug-config <路徑>` - debug config 檔案路徑（必填）
+- `-c, --collect-duration <秒數>` - 刷新間隔，單位為秒（預設：600）
 
 ---
 
