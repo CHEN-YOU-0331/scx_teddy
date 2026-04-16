@@ -95,7 +95,9 @@ struct Args {
     #[arg(short, long, default_value_t = 600)]
     collect_duration: u64,
 
-    /// Mode: "collect" to generate event.csv, "classify" to use a trained model
+    /// Mode: "collect" to generate event.csv, "classify" to use a trained model,
+    /// "debug_classify" to print cluster assignments for selected comms without
+    /// modifying scheduling.
     #[arg(short, long, default_value = "collect")]
     mode: String,
 
@@ -114,6 +116,25 @@ struct Args {
     /// Path to scheduling config JSON (classify mode)
     #[arg(long)]
     config: Option<String>,
+
+    /// Path to debug config file (debug_classify mode). One comm name per line;
+    /// lines starting with '#' are comments. Matching is by prefix.
+    #[arg(long)]
+    debug_config: Option<String>,
+}
+
+/// Load a debug config file: one comm prefix per line, '#' starts comments.
+fn load_debug_config(path: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read debug config: {}", path))?;
+    let mut patterns = Vec::new();
+    for line in content.lines() {
+        let s = line.split('#').next().unwrap_or("").trim();
+        if !s.is_empty() {
+            patterns.push(s.to_string());
+        }
+    }
+    Ok(patterns)
 }
 
 unsafe impl Plain for TaskEvent {}
@@ -173,8 +194,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.mode.as_str() {
-        "collect" | "classify" => {}
-        _ => anyhow::bail!("Invalid mode '{}'. Use 'collect' or 'classify'.", args.mode),
+        "collect" | "classify" | "debug_classify" => {}
+        _ => anyhow::bail!(
+            "Invalid mode '{}'. Use 'collect', 'classify', or 'debug_classify'.",
+            args.mode
+        ),
     }
 
     // Load model and config for classify mode
@@ -193,6 +217,24 @@ fn main() -> Result<()> {
         println!("Loaded scheduling config from {}", config_path);
 
         (Some(m), Some(cfg))
+    } else {
+        (None, None)
+    };
+
+    // Load model and debug patterns for debug_classify mode
+    let (debug_model, debug_patterns) = if args.mode == "debug_classify" {
+        let model_path = args.model.as_deref()
+            .context("debug_classify mode requires --model <path>")?;
+        let m = classifier::load_model(model_path)?;
+        println!("Loaded model from {} ({} clusters)", model_path, m.n_clusters());
+
+        let debug_path = args.debug_config.as_deref()
+            .context("debug_classify mode requires --debug-config <path>")?;
+        let patterns = load_debug_config(debug_path)?;
+        println!("Loaded debug config from {} ({} comm patterns): {:?}",
+            debug_path, patterns.len(), patterns);
+
+        (Some(m), Some(patterns))
     } else {
         (None, None)
     };
@@ -254,7 +296,52 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
 
-            if let (Some(ref classifier), Some(ref cfg)) = (&model, &sched_config) {
+            if let (Some(ref classifier), Some(ref patterns)) = (&debug_model, &debug_patterns) {
+                // Debug classify mode: print predicted cluster for matched comms,
+                // do NOT update scheduler_config or update_map.
+                let n = classifier.n_clusters();
+                let mut cluster_tasks: Vec<Vec<(i32, String)>> = vec![Vec::new(); n];
+
+                for (&tid, task_stats) in stats_map.iter() {
+                    if task_stats.exit != 0 || task_stats.event_count < args.min_events {
+                        continue;
+                    }
+                    let comm = read_proc_comm(tid);
+                    let matched = patterns.iter().any(|p| comm == *p || comm.starts_with(p));
+                    if !matched {
+                        continue;
+                    }
+                    let named_stats = task_stats.get_named_stats();
+                    let features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
+                    let cluster = classifier.predict(&features);
+                    cluster_tasks[cluster].push((tid, comm));
+                }
+
+                // Build per-comm → cluster count map
+                let mut comm_clusters: std::collections::BTreeMap<String, Vec<usize>> =
+                    std::collections::BTreeMap::new();
+                for (cluster_id, tasks) in cluster_tasks.iter().enumerate() {
+                    for (_tid, comm) in tasks {
+                        comm_clusters.entry(comm.clone()).or_default().push(cluster_id);
+                    }
+                }
+
+                print!("\x1b[H\x1b[2J\x1b[3J");
+                println!("[debug_classify]");
+                for (comm, clusters) in &comm_clusters {
+                    // Count occurrences per cluster
+                    let mut counts: std::collections::BTreeMap<usize, usize> =
+                        std::collections::BTreeMap::new();
+                    for &c in clusters {
+                        *counts.entry(c).or_insert(0) += 1;
+                    }
+                    let summary: Vec<String> = counts.iter()
+                        .map(|(c, cnt)| format!("cluster{}: {}", c, cnt))
+                        .collect();
+                    println!("  {}: [{}]", comm, summary.join(", "));
+                }
+                std::io::stdout().flush().ok();
+            } else if let (Some(ref classifier), Some(ref cfg)) = (&model, &sched_config) {
                 // Classify mode: predict cluster and update BPF map
                 let n = classifier.n_clusters();
                 let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
