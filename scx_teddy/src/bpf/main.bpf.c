@@ -62,6 +62,7 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_cnt = target_ctx->sleep_cnt;
     e->yield_cnt = target_ctx->yield_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
+    e->futex_wait_cnt = target_ctx->futex_wait_cnt;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -74,6 +75,7 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     target_ctx->sleep_cnt = 0;
     target_ctx->yield_cnt = 0;
     target_ctx->in_iowait_cnt = 0;
+    target_ctx->futex_wait_cnt = 0;
 }
 
 static target_ctx_t *get_target_storage(struct task_struct *p)
@@ -299,3 +301,13 @@ SCX_OPS_DEFINE(teddy_ops,
                .exit           = (void *)teddy_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,
                .name           = "teddy");
+
+SEC("kprobe/futex_wait")
+int BPF_KPROBE(trace_futex_wait)
+{
+    struct task_struct *p = bpf_get_current_task_btf();
+    target_ctx_t *target_ctx = get_target_storage(p);
+    if (target_ctx)
+        target_ctx->futex_wait_cnt++;
+    return 0;
+}

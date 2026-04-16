@@ -9,7 +9,8 @@ pub struct TaskEvent {
     pub runtime_sq_sum: u64,
     pub yield_cnt: u32,
     pub sleep_cnt: u32,
-    pub in_iowait_cnt: u32
+    pub in_iowait_cnt: u32,
+    pub futex_wait_cnt: u32
 }
 
 #[derive(Debug, Clone, Default)]
@@ -25,6 +26,7 @@ pub struct TaskStats {
 
     yield_cnt: u64,
     in_iowait_cnt: u64,
+    futex_wait_cnt: u64,
 
     pub event_count: u64,
     parent: i32,
@@ -43,6 +45,7 @@ impl TaskStats {
 
             yield_cnt: 0,
             in_iowait_cnt: 0,
+            futex_wait_cnt: 0,
 
             event_count: 0,
             parent,
@@ -64,6 +67,7 @@ impl TaskStats {
         
         self.yield_cnt += event.yield_cnt as u64;
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
+        self.futex_wait_cnt += event.futex_wait_cnt as u64;
     }
 
     fn avg_runtime_ms(&self) -> f64 {
@@ -114,11 +118,11 @@ impl TaskStats {
         if avg > 0.0 { self.stddev_sleep_ms() / avg } else { 0.0 }
     }
 
-    fn iowait_ratio(&self) -> f64 {
+    fn sleep_base_ratio(&self, cnt: u64) -> f64 {
         if (self.sleep_count == 0) {
             return 0 as f64;
         }
-        (self.in_iowait_cnt as f64) / (self.sleep_count as f64)
+        (cnt as f64) / (self.sleep_count as f64)
     }
 
     /// Returns (name, value) pairs for all features.
@@ -129,7 +133,8 @@ impl TaskStats {
             ("runtime_cv", self.runtime_cv()),
             ("avg_sleep_ms", self.avg_sleep_ms()),
             ("sleep_cv", self.sleep_cv()),
-            ("iowait_ratio", self.iowait_ratio()),
+            ("iowait_ratio", self.sleep_base_ratio(self.in_iowait_cnt)),
+            ("futex_wait_ratio", self.sleep_base_ratio(self.futex_wait_cnt)),
         ]
     }
 

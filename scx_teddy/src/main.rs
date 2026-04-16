@@ -209,6 +209,8 @@ fn main() -> Result<()> {
 
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
 
+    let _futex_wait = skel.progs.trace_futex_wait.attach()?;
+
     // Load and attach the scheduler struct_ops
     let _struct_ops = skel
         .maps
