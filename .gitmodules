@@ -1,0 +1,3 @@
+[submodule "schbench"]
+	path = schbench
+	url = https://github.com/weiso131/schbench
