@@ -53,8 +53,7 @@ typedef struct target_ctx {
     u64 sleep_sq_sum;
     u64 runtime_sum;
     u64 runtime_sq_sum;
-    u32 yield_cnt; // 1 ns add 1 still not overflow
-    u32 sleep_cnt;
+    u32 sleep_cnt; // 1 ns add 1 still not overflow
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
 } target_ctx_t;
@@ -67,7 +66,6 @@ typedef struct task_event {
     u64 sleep_sq_sum;
     u64 runtime_sum;
     u64 runtime_sq_sum;
-    u32 yield_cnt;
     u32 sleep_cnt;
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;

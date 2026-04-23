@@ -7,7 +7,6 @@ pub struct TaskEvent {
     pub sleep_sq_sum: u64,
     pub runtime_sum: u64,
     pub runtime_sq_sum: u64,
-    pub yield_cnt: u32,
     pub sleep_cnt: u32,
     pub in_iowait_cnt: u32,
     pub futex_wait_cnt: u32
@@ -24,7 +23,6 @@ pub struct TaskStats {
     sleep_sq_sum: f64,
     sleep_count: u64,  // Number of events with sleep (used internally for avg/cv)
 
-    yield_cnt: u64,
     in_iowait_cnt: u64,
     futex_wait_cnt: u64,
 
@@ -43,7 +41,6 @@ impl TaskStats {
             sleep_sq_sum: 0.0,
             sleep_count: 0,
 
-            yield_cnt: 0,
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
 
@@ -65,7 +62,6 @@ impl TaskStats {
         self.sleep_sum += event.sleep_sum;
         self.sleep_sq_sum += event.sleep_sq_sum as f64;
         
-        self.yield_cnt += event.yield_cnt as u64;
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
         self.futex_wait_cnt += event.futex_wait_cnt as u64;
     }

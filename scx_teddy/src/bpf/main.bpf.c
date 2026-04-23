@@ -60,7 +60,6 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->runtime_sum = target_ctx->runtime_sum;
     e->runtime_sq_sum = target_ctx->runtime_sq_sum;
     e->sleep_cnt = target_ctx->sleep_cnt;
-    e->yield_cnt = target_ctx->yield_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
 
@@ -73,7 +72,6 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     target_ctx->runtime_sum = 0;
     target_ctx->runtime_sq_sum = 0;
     target_ctx->sleep_cnt = 0;
-    target_ctx->yield_cnt = 0;
     target_ctx->in_iowait_cnt = 0;
     target_ctx->futex_wait_cnt = 0;
 }
@@ -272,15 +270,6 @@ void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task
 clear_tracing_data:
 }
 
-bool BPF_STRUCT_OPS(teddy_yield, struct task_struct *from, struct task_struct *to)
-{
-    target_ctx_t *target_ctx = get_target_storage(from);
-    if (!target_ctx)
-        return false;
-    target_ctx->yield_cnt++;
-    return false;
-}
-
 /* Scheduler exit - record exit info */
 void BPF_STRUCT_OPS(teddy_exit, struct scx_exit_info *ei)
 {
@@ -295,7 +284,6 @@ SCX_OPS_DEFINE(teddy_ops,
                .runnable       = (void *)teddy_runnable,
                .running        = (void *)teddy_running,
                .stopping       = (void *)teddy_stopping,
-               .yield          = (bool *)teddy_yield,
                .exit_task      = (void *)teddy_exit_task,
                .init           = (void *)teddy_init,
                .exit           = (void *)teddy_exit,
