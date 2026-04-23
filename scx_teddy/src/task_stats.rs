@@ -135,6 +135,7 @@ impl TaskStats {
             ("sleep_cv", self.sleep_cv()),
             ("iowait_ratio", self.sleep_base_ratio(self.in_iowait_cnt)),
             ("futex_wait_ratio", self.sleep_base_ratio(self.futex_wait_cnt)),
+            ("runtime_ratio", self.avg_runtime_ms() / (self.avg_runtime_ms() + self.avg_sleep_ms())),
         ]
     }
 
