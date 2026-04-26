@@ -11,6 +11,8 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+#define MIN_SEND_INTERVAL 100000000
+
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -37,7 +39,7 @@ struct {
     __type(value, sched_info_t);
 } update_map SEC(".maps");
 
-static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
+static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
     u32 *pause_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
@@ -45,11 +47,18 @@ static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     if (*pause_ringbuf) {
         return; // don't clear the data
     }
-        
+    
+    u64 now = scx_bpf_now();
+
+    if (now - target_ctx->last_send_time < MIN_SEND_INTERVAL)
+        return;
+    target_ctx->last_send_time = now;
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
-    if (!e)
+    if (!e) {
+        bpf_printk("RINGBUF_FULL");
         return; // Ring buffer full, drop event
+    }
 
     // Fill event data
     e->tid = p->pid;
@@ -90,6 +99,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->slice = DEFAULT_SLICE;
         target_ctx->prio = TIER_BATCH;
         target_ctx->config = 1;
+        target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
     }
@@ -231,13 +241,13 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         target_ctx->sleep_cnt++;
         if (target_ctx->sleep_start != 0) {
             update_event_data(target_ctx);
-            data_to_user(p, target_ctx);
+            try_data_to_user(p, target_ctx);
         }
         target_ctx->sleep_start = now;
     } else {
         if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
             update_event_data(target_ctx);
-            data_to_user(p, target_ctx);
+            try_data_to_user(p, target_ctx);
         }
     }
 

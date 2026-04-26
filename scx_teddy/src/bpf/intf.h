@@ -48,6 +48,8 @@ typedef struct target_ctx {
     u64 sleep_end;
     u64 runtime_ns;
 
+    u64 last_send_time;
+
     u32 event_cnt;
     u64 sleep_sum; // use 1e-6 sec
     u64 sleep_sq_sum;
