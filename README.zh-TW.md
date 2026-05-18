@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## 使用方式
 
-scx_teddy 有三種模式：**collect**（收集任務資料）、**classify**（套用訓練好的模型進行排程）、以及 **debug_classify**（在不影響排程的情況下查看分群結果）。
+scx_teddy 有兩種模式：**collect**（收集任務資料）以及 **classify**（套用訓練好的模型進行排程）。
 
 ### 步驟一：收集任務資料
 
@@ -117,44 +117,6 @@ sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config co
 **分類模式額外選項：**
 - `--model <路徑>` - 訓練好的模型 JSON 路徑（必填）
 - `--config <路徑>` - 排程設定 JSON 路徑（必填）
-- `-c, --collect-duration <秒數>` - 刷新間隔，單位為秒（預設：600）
-
-### 步驟五：除錯分類模式（選用）
-
-`debug_classify` 模式使用相同的訓練模型，但**不會**修改時間片或優先權。每隔一段時間會清空終端機並印出被監看任務目前被分到哪個 cluster。
-
-```bash
-sudo ./target/release/scx_teddy -m debug_classify -c 10 \
-  --model model.json --debug-config debug.config
-```
-
-建立 `debug.config` 檔案，列出要監看的 `comm` 名稱，每行一個（prefix 比對，`#` 為註解）：
-
-```
-# custom workloads
-fixed-mutex
-slow-timer
-random-timer
-
-# stress-ng workers（prefix 比對）
-stress-ng-cpu
-stress-ng-hdd
-stress-ng-timer
-stress-ng-switc
-```
-
-輸出格式（每隔 `--collect-duration` 秒刷新一次）：
-
-```
-[debug_classify]
-  fixed-mutex: [cluster3: 12]
-  stress-ng-cpu: [cluster0: 11, cluster2: 1]
-  stress-ng-timer: [cluster5: 12]
-```
-
-**debug_classify 模式額外選項：**
-- `--model <路徑>` - 訓練好的模型 JSON 路徑（必填）
-- `--debug-config <路徑>` - debug config 檔案路徑（必填）
 - `-c, --collect-duration <秒數>` - 刷新間隔，單位為秒（預設：600）
 
 ---
