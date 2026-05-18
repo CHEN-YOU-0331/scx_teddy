@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 //! scx_teddy - A BPF scheduler based on task runtime characteristics
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::io::BufRead;
 use std::mem::MaybeUninit;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -141,12 +143,17 @@ fn thread_cpu_time() -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
+/// Shared task statistics. The ring-buffer callback writes into it and the
+/// main loop reads from it; both run on the same thread, so RefCell (not a
+/// mutex) is enough — the borrows never overlap.
+type StatsMap = Rc<RefCell<HashMap<i32, TaskStats>>>;
+
 // Process event received from ring buffer
-fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, TaskStats>>>) -> i32 {
+fn process_event(data: &[u8], stats: &StatsMap) -> i32 {
     let event = plain::from_bytes::<TaskEvent>(data).unwrap();
 
     // Update statistics
-    let mut stats = stats.lock().unwrap();
+    let mut stats = stats.borrow_mut();
 
     if event.parent > 0 {
         let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
@@ -192,50 +199,109 @@ fn read_proc_comm(tid: i32) -> String {
         .unwrap_or_default()
 }
 
-/// In-memory representation of the collect-mode CSV: an ordered list of rows
-/// plus a tid -> row index map for O(1) updates.
-struct CsvStore {
-    rows: Vec<(i32, String)>,
-    tids: HashMap<i32, usize>,
+/// Format one task's stats into a CSV row, reading tgid/ppid/comm from /proc.
+fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
+    let tgid = read_proc_field(tid, "Tgid")
+        .map(|v| v.to_string()).unwrap_or_default();
+    let ppid = read_proc_field(tid, "PPid")
+        .map(|v| v.to_string()).unwrap_or_default();
+    let comm = read_proc_comm(tid);
+    let values: Vec<String> = task_stats.get_stats().iter()
+        .map(|v| format!("{}", v)).collect();
+    format!("{},{},{},{},{}", tid, tgid, ppid, comm, values.join(","))
 }
 
-/// Load an existing CSV (if present) into a CsvStore. The header is skipped;
-/// each remaining line is keyed by its first column (tid).
-fn load_csv(path: &str) -> Result<CsvStore> {
-    let mut rows: Vec<(i32, String)> = Vec::new();
-    let mut tids: HashMap<i32, usize> = HashMap::new();
-
-    if std::path::Path::new(path).exists() {
-        let reader = std::io::BufReader::new(
-            std::fs::File::open(path)
-                .context("Failed to open existing CSV for reading")?
-        );
-        for (i, line) in reader.lines().enumerate() {
-            let line = line.context("Failed to read CSV line")?;
-            if i == 0 {
-                continue; // skip header
-            }
-            if let Some(tid_str) = line.split(',').next() {
-                if let Ok(tid) = tid_str.trim().parse::<i32>() {
-                    tids.insert(tid, rows.len());
-                    rows.push((tid, line));
-                }
-            }
-        }
-    }
-
-    Ok(CsvStore { rows, tids })
-}
-
-/// Write a CsvStore back to disk, prepending the feature header.
-fn write_csv(path: &str, store: &CsvStore) -> Result<()> {
+/// Write `rows` to a fresh CSV at `path`, header first. The output path is
+/// checked for non-existence at startup, so this is a plain write — no merge
+/// with any prior file.
+fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<()> {
     let mut file = std::fs::File::create(path)
         .context("Failed to create output CSV")?;
     writeln!(file, "{}", csv_header())
         .context("Failed to write CSV header")?;
-    for (_, row) in &store.rows {
+    for (_, row) in rows {
         writeln!(file, "{}", row)
             .context("Failed to write CSV row")?;
+    }
+    println!("CSV written: {} rows", rows.len());
+    Ok(())
+}
+
+/// Pack every eligible task in `stats_map` into CSV rows and write them out via
+/// `write_csv`. `stats_map` is the single source of truth — no buffer is kept
+/// between cycles.
+fn collect_data(
+    stats_map: &HashMap<i32, TaskStats>,
+    output: &str,
+    min_events: u64,
+) -> Result<()> {
+    let rows: Vec<(i32, String)> = stats_map.iter()
+        .filter(|(_, ts)| ts.exit == 0 && ts.event_count >= min_events)
+        .map(|(&tid, ts)| (tid, task_csv_row(tid, ts)))
+        .collect();
+    write_csv(output, &rows)
+}
+
+/// Run one classify cycle: predict each eligible task's cluster and write the
+/// resulting {prio, slice} into `update_map`. Only tasks with new data since
+/// the last cycle are processed (`take_features_if_needed`).
+fn run_classify_cycle(
+    stats_map: &mut HashMap<i32, TaskStats>,
+    update_map: &libbpf_rs::Map,
+    classifier: &dyn classifier::Classifier,
+    cfg: &SchedConfig,
+    min_events: u64,
+) -> Result<()> {
+    let n = classifier.n_clusters();
+    let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
+
+    let wall_start = Instant::now();
+    let cpu_start = thread_cpu_time();
+    let mut predict_count: usize = 0;
+
+    for (&tid, task_stats) in stats_map.iter_mut() {
+        if task_stats.exit != 0 || task_stats.event_count < min_events {
+            continue;
+        }
+        let Some((features, named_stats)) = task_stats.take_features_if_needed() else {
+            continue;
+        };
+        let cluster = classifier.predict(&features);
+        predict_count += 1;
+        cluster_tids[cluster].push(tid);
+
+        let cluster_cfg = cfg.clusters
+            .get(&cluster.to_string())
+            .unwrap_or(&cfg.default);
+
+        let prio = cluster_cfg.prio;
+        let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
+
+        // Write sched_info_t {prio: s32, slice: u64} to update_map
+        // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
+        let tid_key = tid.to_ne_bytes();
+        let mut val_buf = [0u8; 16];
+        val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
+        val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
+        update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+    }
+
+    let batch_wall_us = wall_start.elapsed().as_micros();
+    let batch_cpu_us  = (thread_cpu_time() - cpu_start).as_micros();
+    let avg_per_task_ns = if predict_count > 0 {
+        (batch_cpu_us * 1000) / predict_count as u128
+    } else { 0 };
+
+    println!("Classification results (updated {} tasks):",
+        cluster_tids.iter().map(|v| v.len()).sum::<usize>());
+    println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
+        batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
+    for (i, tids) in cluster_tids.iter().enumerate() {
+        let cluster_cfg = cfg.clusters
+            .get(&i.to_string())
+            .unwrap_or(&cfg.default);
+        println!("  Cluster {} (prio={}, {} tasks)",
+            i, cluster_cfg.prio, tids.len());
     }
     Ok(())
 }
@@ -249,6 +315,15 @@ fn main() -> Result<()> {
             "Invalid mode '{}'. Use 'collect' or 'classify'.",
             args.mode
         ),
+    }
+
+    // Collect mode refuses to overwrite an existing CSV: bail early so a run
+    // never destroys prior data. Pick a new path or remove the old file.
+    if args.mode == "collect" && std::path::Path::new(&args.output).exists() {
+        anyhow::bail!(
+            "Output file '{}' already exists; choose a different --output path.",
+            args.output
+        );
     }
 
     // Load model and config for classify mode
@@ -293,9 +368,8 @@ fn main() -> Result<()> {
         .context("Failed to attach struct_ops")?;
 
     // Statistics storage
-    let stats: Arc<Mutex<std::collections::HashMap<i32, TaskStats>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let stats_clone = Arc::clone(&stats);
+    let stats: StatsMap = Rc::new(RefCell::new(HashMap::new()));
+    let stats_clone = Rc::clone(&stats);
 
     let mut builder = libbpf_rs::RingBufferBuilder::new();
     builder
@@ -304,6 +378,7 @@ fn main() -> Result<()> {
     let ringbuf = builder.build().context("Failed to build ringbuf")?;
 
     let scheduler_config = &skel.maps.scheduler_config;
+    let update_map = &skel.maps.update_map;
 
     println!("scx_teddy scheduler loaded successfully!");
     println!("Press Ctrl+C to exit...\n");
@@ -319,19 +394,11 @@ fn main() -> Result<()> {
 
     let mut start_time = Instant::now();
     let duration = Duration::from_secs(args.collect_duration);
+    let collect_mode = model.is_none();
 
-    // Collect mode keeps the CSV in memory: load it once here, accumulate
-    // updates each cycle, and write it back on shutdown (or every cycle when
-    // --csv-checkpoint is set). None in classify mode.
-    let mut csv_store = if model.is_none() {
-        Some(load_csv(&args.output)?)
-    } else {
-        None
-    };
-
-    // Overall run-time limit (collect mode only): once start_time is this far
-    // in the past the loop stops and the CSV is flushed. None means no limit.
-    let run_deadline = if csv_store.is_some() && args.max_runtime > 0 {
+    // Overall run-time limit (collect mode only): once this deadline passes the
+    // loop stops and the CSV is flushed. None means no limit.
+    let run_deadline = if collect_mode && args.max_runtime > 0 {
         Some(start_time + Duration::from_secs(args.max_runtime))
     } else {
         None
@@ -343,115 +410,31 @@ fn main() -> Result<()> {
         && run_deadline.is_none_or(|d| Instant::now() < d)
     {
         if start_time.elapsed() >= duration {
+            // Pause pushing events into the ring buffer while this cycle runs,
+            // so the buffer cannot overflow during prediction / CSV work.
             let key = 0u32.to_ne_bytes();
-            let mut val = 1u32.to_ne_bytes();
-            scheduler_config.update(&key, &val, MapFlags::ANY)?;
-            let mut stats_map = stats.lock().unwrap();
+            scheduler_config.update(&key, &1u32.to_ne_bytes(), MapFlags::ANY)?;
 
-            if let (Some(ref classifier), Some(ref cfg)) = (&model, &sched_config) {
-                // Classify mode: predict cluster and update BPF map
-                let n = classifier.n_clusters();
-                let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
-                let update_map = &skel.maps.update_map;
-
-                let wall_start = Instant::now();
-                let cpu_start = thread_cpu_time();
-                let mut predict_count: usize = 0;
-
-                for (&tid, task_stats) in stats_map.iter_mut() {
-                    if task_stats.exit != 0 || task_stats.event_count < args.min_events{
-                        continue;
-                    }
-                    let Some((features, named_stats)) = task_stats.take_features_if_needed() else {
-                        continue;
-                    };
-                    let cluster = classifier.predict(&features);
-                    predict_count += 1;
-                    cluster_tids[cluster].push(tid);
-
-                    let cluster_cfg = cfg.clusters
-                        .get(&cluster.to_string())
-                        .unwrap_or(&cfg.default);
-
-                    let prio = cluster_cfg.prio;
-                    let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
-
-                    // Write sched_info_t {prio: s32, slice: u64} to update_map
-                    // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
-                    let tid_key = tid.to_ne_bytes();
-                    let mut val_buf = [0u8; 16];
-                    val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
-                    val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
-                    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
-                }
-
-                let batch_wall_us = wall_start.elapsed().as_micros();
-                let batch_cpu_us  = (thread_cpu_time() - cpu_start).as_micros();
-                let avg_per_task_ns = if predict_count > 0 {
-                    (batch_cpu_us * 1000) / predict_count as u128
-                } else { 0 };
-
-                println!("Classification results (updated {} tasks):",
-                    cluster_tids.iter().map(|v| v.len()).sum::<usize>());
-                println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
-                    batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
-                for (i, tids) in cluster_tids.iter().enumerate() {
-                    let cluster_cfg = cfg.clusters
-                        .get(&i.to_string())
-                        .unwrap_or(&cfg.default);
-                    println!("  Cluster {} (prio={}, {} tasks)",
-                        i, cluster_cfg.prio, tids.len());
-                }
-            } else if let Some(store) = csv_store.as_mut() {
-                // Collect mode: merge this cycle's stats into the in-memory CSV.
-                let mut new_count = 0u64;
-                let mut update_count = 0u64;
-                for (&tid, task_stats) in stats_map.iter() {
-                    if task_stats.exit != 0 || task_stats.event_count < args.min_events{
-                        continue;
-                    }
-                    let tgid = read_proc_field(tid, "Tgid")
-                        .map(|v| v.to_string()).unwrap_or_default();
-                    let ppid = read_proc_field(tid, "PPid")
-                        .map(|v| v.to_string()).unwrap_or_default();
-                    let comm = read_proc_comm(tid);
-                    let stats_arr = task_stats.get_stats();
-                    let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
-                    let row = format!("{},{},{},{},{}", tid, tgid, ppid, comm, values.join(","));
-
-                    if let Some(&idx) = store.tids.get(&tid) {
-                        store.rows[idx].1 = row;
-                        update_count += 1;
-                    } else {
-                        store.tids.insert(tid, store.rows.len());
-                        store.rows.push((tid, row));
-                        new_count += 1;
-                    }
-                }
-
-                // Checkpoint to disk each cycle only when requested; otherwise
-                // the CSV is written once on shutdown.
-                if args.csv_checkpoint {
-                    write_csv(&args.output, store)?;
-                }
-                println!("CSV {}: {} new, {} updated, {} total rows",
-                    if args.csv_checkpoint { "updated" } else { "buffered" },
-                    new_count, update_count, store.rows.len());
+            if let (Some(classifier), Some(cfg)) = (&model, &sched_config) {
+                run_classify_cycle(&mut stats.borrow_mut(), update_map,
+                    classifier.as_ref(), cfg, args.min_events)?;
+            } else if args.csv_checkpoint {
+                // Collect mode writes the CSV every cycle only with this flag;
+                // otherwise it is flushed once on shutdown.
+                collect_data(&stats.borrow(), &args.output, args.min_events)?;
             }
 
             start_time = Instant::now();
-            val = 0u32.to_ne_bytes();
-            scheduler_config.update(&key, &val, MapFlags::ANY)?;
+            scheduler_config.update(&key, &0u32.to_ne_bytes(), MapFlags::ANY)?;
         }
         ringbuf.poll(Duration::from_millis(1000))?;
     }
 
     println!("scx_teddy scheduler exiting...");
 
-    // Flush the in-memory CSV on shutdown (collect mode).
-    if let Some(store) = csv_store.as_ref() {
-        write_csv(&args.output, store)?;
-        println!("CSV written: {} total rows", store.rows.len());
+    // Flush the CSV on shutdown (collect mode).
+    if collect_mode {
+        collect_data(&stats.borrow(), &args.output, args.min_events)?;
     }
 
     scx_utils::uei_report!(&skel, uei)
