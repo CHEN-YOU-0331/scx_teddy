@@ -40,6 +40,7 @@ sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 - `-o, --output <PATH>` - Output CSV file path (default: `event.csv`)
 - `--min-events <N>` - Minimum event count to include a task (default: 3)
 - `--csv-checkpoint` - Write the CSV every collect cycle. By default the CSV is kept in memory and written only once on shutdown; enable this to checkpoint each cycle so a crash or `kill -9` does not lose the run's data.
+- `--max-runtime <SECONDS>` - Maximum total run time. Once reached, the in-memory CSV is written out and the scheduler exits. `0` means no limit (default: `0`).
 - `-v, --verbose` - Enable verbose output
 
 ### Step 2: Train a K-means Model

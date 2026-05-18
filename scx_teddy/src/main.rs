@@ -113,6 +113,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     csv_checkpoint: bool,
 
+    /// Maximum total run time in seconds (collect mode). Once reached, the
+    /// in-memory CSV is written out and the scheduler exits. 0 means no limit.
+    #[arg(long, default_value_t = 0)]
+    max_runtime: u64,
+
     /// Path to trained model JSON (classify mode)
     #[arg(long)]
     model: Option<String>,
@@ -324,8 +329,19 @@ fn main() -> Result<()> {
         None
     };
 
+    // Overall run-time limit (collect mode only): once start_time is this far
+    // in the past the loop stops and the CSV is flushed. None means no limit.
+    let run_deadline = if csv_store.is_some() && args.max_runtime > 0 {
+        Some(start_time + Duration::from_secs(args.max_runtime))
+    } else {
+        None
+    };
+
     // Main loop - keep scheduler running
-    while *running.lock().unwrap() && !scx_utils::uei_exited!(&skel, uei) {
+    while *running.lock().unwrap()
+        && !scx_utils::uei_exited!(&skel, uei)
+        && run_deadline.is_none_or(|d| Instant::now() < d)
+    {
         if start_time.elapsed() >= duration {
             let key = 0u32.to_ne_bytes();
             let mut val = 1u32.to_ne_bytes();

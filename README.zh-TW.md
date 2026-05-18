@@ -40,6 +40,7 @@ sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 - `-o, --output <路徑>` - 輸出 CSV 檔案路徑（預設：`event.csv`）
 - `--min-events <N>` - 最低事件數門檻，低於此數的任務會被忽略（預設：3）
 - `--csv-checkpoint` - 每個收集週期都寫入 CSV。預設情況下 CSV 會保留在記憶體中，僅在關閉時寫入一次；啟用此選項可在每個週期 checkpoint，避免當機或 `kill -9` 導致本次收集的資料遺失。
+- `--max-runtime <秒數>` - 最大總執行時間。達到後會將記憶體中的 CSV 寫出並結束排程器。`0` 表示不限時（預設：`0`）。
 - `-v, --verbose` - 啟用詳細輸出
 
 ### 步驟二：訓練 K-means 模型
