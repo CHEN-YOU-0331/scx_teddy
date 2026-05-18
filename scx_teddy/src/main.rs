@@ -107,6 +107,12 @@ struct Args {
     #[arg(short, long, default_value = "event.csv")]
     output: String,
 
+    /// Write the CSV every collect cycle (collect mode). By default the CSV is
+    /// only written once on shutdown; enable this to checkpoint each cycle so a
+    /// crash or `kill -9` does not lose the run's data.
+    #[arg(long, default_value_t = false)]
+    csv_checkpoint: bool,
+
     /// Path to trained model JSON (classify mode)
     #[arg(long)]
     model: Option<String>,
@@ -179,6 +185,54 @@ fn read_proc_comm(tid: i32) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+/// In-memory representation of the collect-mode CSV: an ordered list of rows
+/// plus a tid -> row index map for O(1) updates.
+struct CsvStore {
+    rows: Vec<(i32, String)>,
+    tids: HashMap<i32, usize>,
+}
+
+/// Load an existing CSV (if present) into a CsvStore. The header is skipped;
+/// each remaining line is keyed by its first column (tid).
+fn load_csv(path: &str) -> Result<CsvStore> {
+    let mut rows: Vec<(i32, String)> = Vec::new();
+    let mut tids: HashMap<i32, usize> = HashMap::new();
+
+    if std::path::Path::new(path).exists() {
+        let reader = std::io::BufReader::new(
+            std::fs::File::open(path)
+                .context("Failed to open existing CSV for reading")?
+        );
+        for (i, line) in reader.lines().enumerate() {
+            let line = line.context("Failed to read CSV line")?;
+            if i == 0 {
+                continue; // skip header
+            }
+            if let Some(tid_str) = line.split(',').next() {
+                if let Ok(tid) = tid_str.trim().parse::<i32>() {
+                    tids.insert(tid, rows.len());
+                    rows.push((tid, line));
+                }
+            }
+        }
+    }
+
+    Ok(CsvStore { rows, tids })
+}
+
+/// Write a CsvStore back to disk, prepending the feature header.
+fn write_csv(path: &str, store: &CsvStore) -> Result<()> {
+    let mut file = std::fs::File::create(path)
+        .context("Failed to create output CSV")?;
+    writeln!(file, "{}", csv_header())
+        .context("Failed to write CSV header")?;
+    for (_, row) in &store.rows {
+        writeln!(file, "{}", row)
+            .context("Failed to write CSV row")?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -261,6 +315,15 @@ fn main() -> Result<()> {
     let mut start_time = Instant::now();
     let duration = Duration::from_secs(args.collect_duration);
 
+    // Collect mode keeps the CSV in memory: load it once here, accumulate
+    // updates each cycle, and write it back on shutdown (or every cycle when
+    // --csv-checkpoint is set). None in classify mode.
+    let mut csv_store = if model.is_none() {
+        Some(load_csv(&args.output)?)
+    } else {
+        None
+    };
+
     // Main loop - keep scheduler running
     while *running.lock().unwrap() && !scx_utils::uei_exited!(&skel, uei) {
         if start_time.elapsed() >= duration {
@@ -323,31 +386,8 @@ fn main() -> Result<()> {
                     println!("  Cluster {} (prio={}, {} tasks)",
                         i, cluster_cfg.prio, tids.len());
                 }
-            } else {
-                // Collect mode: write stats to CSV
-                // Read existing CSV rows into an ordered map (tid -> row string)
-                let mut existing_rows: Vec<(i32, String)> = Vec::new();
-                let mut existing_tids: HashMap<i32, usize> = HashMap::new();
-
-                if std::path::Path::new(&args.output).exists() {
-                    let reader = std::io::BufReader::new(
-                        std::fs::File::open(&args.output)
-                            .context("Failed to open existing CSV for reading")?
-                    );
-                    for (i, line) in reader.lines().enumerate() {
-                        let line = line.context("Failed to read CSV line")?;
-                        if i == 0 {
-                            continue; // skip header
-                        }
-                        if let Some(tid_str) = line.split(',').next() {
-                            if let Ok(tid) = tid_str.trim().parse::<i32>() {
-                                existing_tids.insert(tid, existing_rows.len());
-                                existing_rows.push((tid, line));
-                            }
-                        }
-                    }
-                }
-
+            } else if let Some(store) = csv_store.as_mut() {
+                // Collect mode: merge this cycle's stats into the in-memory CSV.
                 let mut new_count = 0u64;
                 let mut update_count = 0u64;
                 for (&tid, task_stats) in stats_map.iter() {
@@ -363,27 +403,24 @@ fn main() -> Result<()> {
                     let values: Vec<String> = stats_arr.iter().map(|v| format!("{}", v)).collect();
                     let row = format!("{},{},{},{},{}", tid, tgid, ppid, comm, values.join(","));
 
-                    if let Some(&idx) = existing_tids.get(&tid) {
-                        existing_rows[idx].1 = row;
+                    if let Some(&idx) = store.tids.get(&tid) {
+                        store.rows[idx].1 = row;
                         update_count += 1;
                     } else {
-                        existing_tids.insert(tid, existing_rows.len());
-                        existing_rows.push((tid, row));
+                        store.tids.insert(tid, store.rows.len());
+                        store.rows.push((tid, row));
                         new_count += 1;
                     }
                 }
 
-                // Write everything back
-                let mut file = std::fs::File::create(&args.output)
-                    .context("Failed to create output CSV")?;
-                writeln!(file, "{}", csv_header())
-                    .context("Failed to write CSV header")?;
-                for (_, row) in &existing_rows {
-                    writeln!(file, "{}", row)
-                        .context("Failed to write CSV row")?;
+                // Checkpoint to disk each cycle only when requested; otherwise
+                // the CSV is written once on shutdown.
+                if args.csv_checkpoint {
+                    write_csv(&args.output, store)?;
                 }
-                println!("CSV updated: {} new, {} updated, {} total rows",
-                    new_count, update_count, existing_rows.len());
+                println!("CSV {}: {} new, {} updated, {} total rows",
+                    if args.csv_checkpoint { "updated" } else { "buffered" },
+                    new_count, update_count, store.rows.len());
             }
 
             start_time = Instant::now();
@@ -394,6 +431,13 @@ fn main() -> Result<()> {
     }
 
     println!("scx_teddy scheduler exiting...");
+
+    // Flush the in-memory CSV on shutdown (collect mode).
+    if let Some(store) = csv_store.as_ref() {
+        write_csv(&args.output, store)?;
+        println!("CSV written: {} total rows", store.rows.len());
+    }
+
     scx_utils::uei_report!(&skel, uei)
         .context("UEI report")?;
 
