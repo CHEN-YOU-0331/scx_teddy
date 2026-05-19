@@ -27,7 +27,7 @@ pub struct TaskStats {
     futex_wait_cnt: u64,
 
     pub event_count: u64,
-    parent: i32,
+    pub parent: i32,
     pub exit: u8,
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.

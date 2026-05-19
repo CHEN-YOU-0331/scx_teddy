@@ -7,7 +7,9 @@ use std::io::Write;
 use std::io::BufRead;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -23,6 +25,7 @@ use libbpf_rs::MapFlags;
 
 mod classifier;
 mod task_stats;
+mod game_task_finder;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
@@ -148,8 +151,58 @@ fn thread_cpu_time() -> Duration {
 /// mutex) is enough — the borrows never overlap.
 type StatsMap = Rc<RefCell<HashMap<i32, TaskStats>>>;
 
+/// Process-progress logger. When `--verbose` is set it opens a log file and
+/// every `log!` call appends a line to it; otherwise it holds `None` and
+/// `log!` is a no-op. Keeping it quiet by default leaves the terminal free
+/// for the Steam-scan interactive interface on the scan thread.
+struct Logger {
+    file: Option<std::fs::File>,
+}
+
+impl Logger {
+    /// Path of the log file written in verbose mode.
+    const LOG_PATH: &'static str = "teddy.log";
+
+    /// Create a logger. In verbose mode the log file is created (truncating
+    /// any previous run); a failure to open it is reported but not fatal —
+    /// the logger simply falls back to no-op.
+    fn new(verbose: bool) -> Self {
+        let file = if verbose {
+            match std::fs::File::create(Self::LOG_PATH) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("warning: cannot open {}: {e}", Self::LOG_PATH);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Logger { file }
+    }
+
+    /// Append one line to the log file. No-op when not in verbose mode.
+    fn line(&mut self, msg: &str) {
+        if let Some(f) = self.file.as_mut() {
+            let _ = writeln!(f, "{}", msg);
+        }
+    }
+}
+
+/// Append a formatted line to a `Rc<RefCell<Logger>>`. No-op in non-verbose
+/// mode. Usage mirrors `println!`: `log!(logger, "x = {}", x)`.
+macro_rules! log {
+    ($logger:expr, $($arg:tt)*) => {
+        $logger.borrow_mut().line(&format!($($arg)*))
+    };
+}
+
 // Process event received from ring buffer
-fn process_event(data: &[u8], stats: &StatsMap) -> i32 {
+fn process_event(
+    data: &[u8],
+    stats: &StatsMap,
+    tracker: &Arc<game_task_finder::GameTracker>,
+) -> i32 {
     let event = plain::from_bytes::<TaskEvent>(data).unwrap();
 
     // Update statistics
@@ -159,8 +212,15 @@ fn process_event(data: &[u8], stats: &StatsMap) -> i32 {
         let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
         task_stats.update(event);
     } else if event.parent == -1 {
+        // A task exited. If it belonged to the tracked game's process family
+        // (its real parent is the tracked game PPID), tell the tracker so it
+        // can decrement the alive count — and wake the scan thread on zero.
+        // The exiting event reports the dead task's real parent in `parent`
+        // of the *original* enqueue; here it is -1, so look up the stored
+        // parent from when the task was first seen.
         if let Some(task_stats) = stats.get_mut(&event.tid) {
             task_stats.exit = 1;
+            tracker.note_process_exit(task_stats.parent);
         }
     }
 
@@ -213,8 +273,8 @@ fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
 
 /// Write `rows` to a fresh CSV at `path`, header first. The output path is
 /// checked for non-existence at startup, so this is a plain write — no merge
-/// with any prior file.
-fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<()> {
+/// with any prior file. Returns the number of rows written.
+fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<usize> {
     let mut file = std::fs::File::create(path)
         .context("Failed to create output CSV")?;
     writeln!(file, "{}", csv_header())
@@ -223,18 +283,17 @@ fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<()> {
         writeln!(file, "{}", row)
             .context("Failed to write CSV row")?;
     }
-    println!("CSV written: {} rows", rows.len());
-    Ok(())
+    Ok(rows.len())
 }
 
 /// Pack every eligible task in `stats_map` into CSV rows and write them out via
 /// `write_csv`. `stats_map` is the single source of truth — no buffer is kept
-/// between cycles.
+/// between cycles. Returns the number of rows written.
 fn collect_data(
     stats_map: &HashMap<i32, TaskStats>,
     output: &str,
     min_events: u64,
-) -> Result<()> {
+) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter(|(_, ts)| ts.exit == 0 && ts.event_count >= min_events)
         .map(|(&tid, ts)| (tid, task_csv_row(tid, ts)))
@@ -251,6 +310,7 @@ fn run_classify_cycle(
     classifier: &dyn classifier::Classifier,
     cfg: &SchedConfig,
     min_events: u64,
+    logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     let n = classifier.n_clusters();
     let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
@@ -292,15 +352,15 @@ fn run_classify_cycle(
         (batch_cpu_us * 1000) / predict_count as u128
     } else { 0 };
 
-    println!("Classification results (updated {} tasks):",
+    log!(logger, "Classification results (updated {} tasks):",
         cluster_tids.iter().map(|v| v.len()).sum::<usize>());
-    println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
+    log!(logger, "  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
         batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
     for (i, tids) in cluster_tids.iter().enumerate() {
         let cluster_cfg = cfg.clusters
             .get(&i.to_string())
             .unwrap_or(&cfg.default);
-        println!("  Cluster {} (prio={}, {} tasks)",
+        log!(logger, "  Cluster {} (prio={}, {} tasks)",
             i, cluster_cfg.prio, tids.len());
     }
     Ok(())
@@ -326,12 +386,16 @@ fn main() -> Result<()> {
         );
     }
 
+    // Process-progress logger: quiet unless --verbose, in which case every
+    // log! call goes to a file. The terminal is left for the Steam-scan UI.
+    let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
+
     // Load model and config for classify mode
     let (model, sched_config) = if args.mode == "classify" {
         let model_path = args.model.as_deref()
             .context("Classify mode requires --model <path>")?;
         let m = classifier::load_model(model_path)?;
-        println!("Loaded model from {} ({} clusters)", model_path, m.n_clusters());
+        log!(logger, "Loaded model from {} ({} clusters)", model_path, m.n_clusters());
 
         let config_path = args.config.as_deref()
             .context("Classify mode requires --config <path>")?;
@@ -339,14 +403,14 @@ fn main() -> Result<()> {
             .with_context(|| format!("Failed to read config: {}", config_path))?;
         let cfg: SchedConfig = serde_json::from_str(&content)
             .context("Failed to parse scheduling config")?;
-        println!("Loaded scheduling config from {}", config_path);
+        log!(logger, "Loaded scheduling config from {}", config_path);
 
         (Some(m), Some(cfg))
     } else {
         (None, None)
     };
 
-    println!("scx_teddy scheduler starting...");
+    log!(logger, "scx_teddy scheduler starting...");
 
     // Build and load eBPF skeleton
     let skel_builder = BpfSkelBuilder::default();
@@ -367,30 +431,61 @@ fn main() -> Result<()> {
         .attach_struct_ops()
         .context("Failed to attach struct_ops")?;
 
+    // Shared game-tracking state. `process_event` (scheduler hot path) and the
+    // scan thread both touch it; the atomics inside keep the hot path lock-free.
+    let tracker = Arc::new(game_task_finder::GameTracker::new());
+
     // Statistics storage
     let stats: StatsMap = Rc::new(RefCell::new(HashMap::new()));
     let stats_clone = Rc::clone(&stats);
+    let tracker_rb = Arc::clone(&tracker);
 
     let mut builder = libbpf_rs::RingBufferBuilder::new();
     builder
-        .add(&skel.maps.events, move |data| process_event(data, &stats_clone))
+        .add(&skel.maps.events,
+             move |data| process_event(data, &stats_clone, &tracker_rb))
         .context("Failed to add ringbuf")?;
     let ringbuf = builder.build().context("Failed to build ringbuf")?;
 
     let scheduler_config = &skel.maps.scheduler_config;
     let update_map = &skel.maps.update_map;
 
-    println!("scx_teddy scheduler loaded successfully!");
-    println!("Press Ctrl+C to exit...\n");
+    log!(logger, "scx_teddy scheduler loaded successfully!");
 
-    // Setup Ctrl+C handler
-    let running = Arc::new(Mutex::new(true));
-    let running_clone = Arc::clone(&running);
+    // Shutdown flag: set by Ctrl+C, watched by the main loop and the scan
+    // thread. The scan thread may be asleep inside `watch`, so the handler
+    // also wakes it via the tracker.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_ctrlc = Arc::clone(&shutdown);
+    let tracker_ctrlc = Arc::clone(&tracker);
     ctrlc::set_handler(move || {
-        println!("\nReceived Ctrl+C, shutting down...");
-        *running_clone.lock().unwrap() = false;
+        shutdown_ctrlc.store(true, Ordering::Release);
+        tracker_ctrlc.signal_wake();
     })
     .expect("Error setting Ctrl+C handler");
+
+    // Steam game-detection thread. `watch()` blocks on select(2)/stdin and
+    // then sleeps while a game runs, so it runs on its own thread. It owns
+    // nothing of the Rc-based scheduler state; it shares only the tracker
+    // (atomics + condvar) and the shutdown flag, both Arc-cloned in.
+    let tracker_scan = Arc::clone(&tracker);
+    let shutdown_scan = Arc::clone(&shutdown);
+    let scan_thread = thread::spawn(move || {
+        game_task_finder::watch(
+            game_task_finder::WatchConfig::default(),
+            &tracker_scan,
+            &shutdown_scan,
+            |trigger, m| {
+                let src = match trigger {
+                    game_task_finder::Trigger::GameName(name) =>
+                        format!("game-name '{name}'"),
+                    game_task_finder::Trigger::Timer => "steam-env scan".to_string(),
+                };
+                println!("[steam] game detected via {src}: ppid={} ({} processes)",
+                    m.ppid, m.procs.len());
+            },
+        );
+    });
 
     let mut start_time = Instant::now();
     let duration = Duration::from_secs(args.collect_duration);
@@ -405,7 +500,7 @@ fn main() -> Result<()> {
     };
 
     // Main loop - keep scheduler running
-    while *running.lock().unwrap()
+    while !shutdown.load(Ordering::Acquire)
         && !scx_utils::uei_exited!(&skel, uei)
         && run_deadline.is_none_or(|d| Instant::now() < d)
     {
@@ -417,11 +512,12 @@ fn main() -> Result<()> {
 
             if let (Some(classifier), Some(cfg)) = (&model, &sched_config) {
                 run_classify_cycle(&mut stats.borrow_mut(), update_map,
-                    classifier.as_ref(), cfg, args.min_events)?;
+                    classifier.as_ref(), cfg, args.min_events, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
-                collect_data(&stats.borrow(), &args.output, args.min_events)?;
+                let n = collect_data(&stats.borrow(), &args.output, args.min_events)?;
+                log!(logger, "CSV written: {} rows", n);
             }
 
             start_time = Instant::now();
@@ -430,11 +526,21 @@ fn main() -> Result<()> {
         ringbuf.poll(Duration::from_millis(1000))?;
     }
 
-    println!("scx_teddy scheduler exiting...");
+    log!(logger, "scx_teddy scheduler exiting...");
+
+    // Stop the scan thread. The loop may have exited via run_deadline or a UEI
+    // rather than Ctrl+C, in which case `shutdown` is still false — set it and
+    // wake the scan thread out of any condvar wait. If it is instead blocked
+    // in select(2) on stdin, it sees `shutdown` after the current timeout
+    // (<= scan_interval_secs), so the join can take up to that long.
+    shutdown.store(true, Ordering::Release);
+    tracker.signal_wake();
+    let _ = scan_thread.join();
 
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
-        collect_data(&stats.borrow(), &args.output, args.min_events)?;
+        let n = collect_data(&stats.borrow(), &args.output, args.min_events)?;
+        log!(logger, "CSV written: {} rows", n);
     }
 
     scx_utils::uei_report!(&skel, uei)
