@@ -218,9 +218,10 @@ fn process_event(
     // Update statistics
     let mut stats = stats.borrow_mut();
 
-    if event.parent > 0 {
+    if event.parent >= 0 {
+        let initial_ancestor = if event.parent == 0 { 1 } else { event.parent };
         let cell = stats.entry(event.tid)
-            .or_insert_with(|| RefCell::new(TaskStats::new(event.parent)));
+            .or_insert_with(|| RefCell::new(TaskStats::new(initial_ancestor)));
         cell.borrow_mut().update(event);
     } else if event.parent == -1 {
         // A task exited. If by now its Union-Find ancestor has collapsed to
