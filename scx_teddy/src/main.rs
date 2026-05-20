@@ -146,10 +146,20 @@ fn thread_cpu_time() -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
-/// Shared task statistics. The ring-buffer callback writes into it and the
-/// main loop reads from it; both run on the same thread, so RefCell (not a
-/// mutex) is enough — the borrows never overlap.
-type StatsMap = Rc<RefCell<HashMap<i32, TaskStats>>>;
+/// Shared task statistics.
+///
+/// Two nested RefCells:
+/// - The outer `RefCell<HashMap<...>>` lets the ring-buffer callback and
+///   the main loop take turns mutating the map structure (insert / remove
+///   entries). They run on the same thread, so RefCell (not a Mutex) is
+///   enough — the borrows never overlap.
+/// - Each entry is wrapped in `RefCell<TaskStats>` so the classify loop
+///   can iterate via `iter()` (immutable borrow of the map) and STILL
+///   look up another entry's `ancestor` to do a Union-Find halving step,
+///   without fighting the borrow checker over a `&mut HashMap` parameter.
+///   Per-entry borrow check is runtime, but the cost is tiny (a counter
+///   load/store, ~1-3 ns) compared to a HashMap lookup (~100-200 ns).
+type StatsMap = Rc<RefCell<HashMap<i32, RefCell<TaskStats>>>>;
 
 /// Process-progress logger. When `--verbose` is set it opens a log file and
 /// every `log!` call appends a line to it; otherwise it holds `None` and
@@ -209,18 +219,25 @@ fn process_event(
     let mut stats = stats.borrow_mut();
 
     if event.parent > 0 {
-        let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
-        task_stats.update(event);
+        let cell = stats.entry(event.tid)
+            .or_insert_with(|| RefCell::new(TaskStats::new(event.parent)));
+        cell.borrow_mut().update(event);
     } else if event.parent == -1 {
-        // A task exited. If it belonged to the tracked game's process family
-        // (its real parent is the tracked game PPID), tell the tracker so it
-        // can decrement the alive count — and wake the scan thread on zero.
-        // The exiting event reports the dead task's real parent in `parent`
-        // of the *original* enqueue; here it is -1, so look up the stored
-        // parent from when the task was first seen.
-        if let Some(task_stats) = stats.get_mut(&event.tid) {
-            task_stats.exit = 1;
-            tracker.note_process_exit(task_stats.parent);
+        // A task exited. If by now its Union-Find ancestor has collapsed to
+        // the tracked game's PPID, it was a game task — tell the tracker to
+        // decrement the alive count and wake the scan thread on zero.
+        //
+        // process_event and run_classify_cycle run on the same thread so
+        // there is no race: by the time an exit lands here, any climbing
+        // done for this tid is already committed to `ancestor`. If the
+        // ancestor hasn't collapsed to game_ppid yet, it wasn't classified
+        // as a game task and shouldn't be counted toward the game family,
+        // which is exactly what note_process_exit's `== game_ppid` check
+        // enforces.
+        if let Some(cell) = stats.get(&event.tid) {
+            let mut ts = cell.borrow_mut();
+            ts.exit = 1;
+            tracker.note_process_exit(ts.ancestor);
         }
     }
 
@@ -290,26 +307,80 @@ fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<usize> {
 /// `write_csv`. `stats_map` is the single source of truth — no buffer is kept
 /// between cycles. Returns the number of rows written.
 fn collect_data(
-    stats_map: &HashMap<i32, TaskStats>,
+    stats_map: &HashMap<i32, RefCell<TaskStats>>,
     output: &str,
     min_events: u64,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
-        .filter(|(_, ts)| ts.exit == 0 && ts.event_count >= min_events)
-        .map(|(&tid, ts)| (tid, task_csv_row(tid, ts)))
+        .filter_map(|(&tid, cell)| {
+            let ts = cell.borrow();
+            if ts.exit == 0 && ts.event_count >= min_events {
+                Some((tid, task_csv_row(tid, &ts)))
+            } else {
+                None
+            }
+        })
         .collect();
     write_csv(output, &rows)
+}
+
+/// Advance one task's Union-Find ancestor pointer by ONE halving step
+/// toward the parent-chain root (init=1 or `game_ppid`).
+///
+/// Caller holds a `&mut TaskStats` (already borrowed from the HashMap
+/// entry via `RefCell::borrow_mut`) and the `&HashMap` (immutable, from
+/// the outer iter). Per-entry RefCell on HashMap values lets both coexist
+/// at the borrow-checker level — the only constraint is that `ts` must
+/// not be the same RefCell as `stats_map[ts.ancestor]`, otherwise the
+/// inner `.borrow()` would panic. In practice that requires a task to be
+/// its own ancestor, which can't happen.
+///
+/// Halving: `ts.ancestor = stats[ts.ancestor].ancestor`. If the
+/// intermediate pid is not in `stats_map` (it never sent an event but
+/// lives in the kernel), fall back to `/proc/<ancestor>/status`'s PPid.
+/// /proc failure defaults to 1 (conservative: "not game").
+///
+/// "Already converged → skip" is the CALLER's job: when `ts.ancestor` is
+/// already 1 or `game_ppid` the caller should not invoke this at all.
+fn climb_one_step(
+    ts: &mut TaskStats,
+    stats_map: &HashMap<i32, RefCell<TaskStats>>,
+    game_ppid: i32,
+) {
+    let a = ts.ancestor;
+    let new_a = match stats_map.get(&a) {
+        Some(parent_cell) => parent_cell.borrow().ancestor,
+        None => read_proc_field(a, "PPid").unwrap_or(1),
+    };
+    // /proc can return PPid 0 for kernel-thread family (parent is
+    // kthreadd / swapper). Fold to 1 so the climb has a single non-game
+    // root.
+    ts.ancestor = if new_a == 0 { 1 } else { new_a };
 }
 
 /// Run one classify cycle: predict each eligible task's cluster and write the
 /// resulting {prio, slice} into `update_map`. Only tasks with new data since
 /// the last cycle are processed (`take_features_if_needed`).
+///
+/// Each task that hasn't already converged also gets ONE Union-Find
+/// halving step on its `ancestor` pointer toward the game-detection root
+/// (1 = init / not game, or `game_ppid` = tracked game). One cycle per
+/// second means an N-deep chain converges in N cycles, which is fine.
+///
+/// Loop shape: thanks to per-entry `RefCell<TaskStats>` we can `iter()`
+/// the map (immutable borrow of the whole HashMap) AND `borrow_mut()`
+/// each entry's TaskStats AND look up another entry's ancestor at the
+/// same time. Borrow check moves from the static type system into the
+/// runtime counters, but the cost is negligible (~1-3 ns per borrow vs.
+/// ~100-200 ns per HashMap lookup), and we get to keep the C-style
+/// "task pointer + map pointer → climb" call shape.
 fn run_classify_cycle(
-    stats_map: &mut HashMap<i32, TaskStats>,
+    stats_map: &HashMap<i32, RefCell<TaskStats>>,
     update_map: &libbpf_rs::Map,
     classifier: &dyn classifier::Classifier,
     cfg: &SchedConfig,
     min_events: u64,
+    tracker: &game_task_finder::GameTracker,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     let n = classifier.n_clusters();
@@ -319,11 +390,20 @@ fn run_classify_cycle(
     let cpu_start = thread_cpu_time();
     let mut predict_count: usize = 0;
 
-    for (&tid, task_stats) in stats_map.iter_mut() {
-        if task_stats.exit != 0 || task_stats.event_count < min_events {
+    let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
+
+    for (&tid, cell) in stats_map.iter() {
+        let mut ts = cell.borrow_mut();
+        if ts.exit != 0 || ts.event_count < min_events {
             continue;
         }
-        let Some((features, named_stats)) = task_stats.take_features_if_needed() else {
+
+        // One halving step, only when not yet converged.
+        if ts.ancestor != 1 && (game_ppid == 0 || ts.ancestor != game_ppid) {
+            climb_one_step(&mut ts, stats_map, game_ppid);
+        }
+
+        let Some((features, named_stats)) = ts.take_features_if_needed() else {
             continue;
         };
         let cluster = classifier.predict(&features);
@@ -511,8 +591,8 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &1u32.to_ne_bytes(), MapFlags::ANY)?;
 
             if let (Some(classifier), Some(cfg)) = (&model, &sched_config) {
-                run_classify_cycle(&mut stats.borrow_mut(), update_map,
-                    classifier.as_ref(), cfg, args.min_events, &logger)?;
+                run_classify_cycle(&stats.borrow(), update_map,
+                    classifier.as_ref(), cfg, args.min_events, &tracker, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.

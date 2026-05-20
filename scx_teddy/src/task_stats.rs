@@ -27,7 +27,14 @@ pub struct TaskStats {
     futex_wait_cnt: u64,
 
     pub event_count: u64,
-    pub parent: i32,
+    /// Union-Find ancestor pointer toward the game-detection root.
+    /// Initialised from the task's real parent (carried in TaskEvent.parent
+    /// at first-seen time), then advanced toward 1 (init, "not game") or
+    /// `game_ppid` (the tracked game's root) by `climb_one_step` in main.rs.
+    /// Once it lands on either of those, the task is classified and the
+    /// field stops moving. NOT the real parent after the first climb —
+    /// use TaskEvent.parent if you need the raw kernel value.
+    pub ancestor: i32,
     pub exit: u8,
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.
@@ -35,7 +42,10 @@ pub struct TaskStats {
 }
 
 impl TaskStats {
-    pub fn new(parent: i32) -> Self {
+    /// Construct a fresh TaskStats. `ancestor` is seeded with the task's
+    /// real parent (from TaskEvent.parent on the first enqueue) and will
+    /// then be collapsed toward `1` or `game_ppid` by `climb_one_step`.
+    pub fn new(ancestor: i32) -> Self {
         Self {
             runtime_sum: 0,
             runtime_sq_sum: 0.0,
@@ -48,7 +58,7 @@ impl TaskStats {
             futex_wait_cnt: 0,
 
             event_count: 0,
-            parent,
+            ancestor,
             exit: 0,
             need_update: 0,
         }
