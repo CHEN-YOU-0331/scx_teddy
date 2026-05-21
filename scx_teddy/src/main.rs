@@ -252,7 +252,7 @@ fn process_event(
 
 fn csv_header() -> String {
     let feature_names = TaskStats::get_feature_names();
-    let mut header = String::from("tid,tgid,ppid,comm");
+    let mut header = String::from("tid,tgid,ancestor,comm");
     for name in &feature_names {
         header.push(',');
         header.push_str(name);
@@ -282,16 +282,16 @@ fn read_proc_comm(tid: i32) -> String {
         .unwrap_or_default()
 }
 
-/// Format one task's stats into a CSV row, reading tgid/ppid/comm from /proc.
+/// Format one task's stats into a CSV row. `ancestor` is the Union-Find
+/// root from `climb_to_root` (1 = not game, or the tracked game PPID), not
+/// the real parent — so it comes from TaskStats, not /proc.
 fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
     let tgid = read_proc_field(tid, "Tgid")
-        .map(|v| v.to_string()).unwrap_or_default();
-    let ppid = read_proc_field(tid, "PPid")
         .map(|v| v.to_string()).unwrap_or_default();
     let comm = read_proc_comm(tid);
     let values: Vec<String> = task_stats.get_stats().iter()
         .map(|v| format!("{}", v)).collect();
-    format!("{},{},{},{},{}", tid, tgid, ppid, comm, values.join(","))
+    format!("{},{},{},{},{}", tid, tgid, task_stats.ancestor, comm, values.join(","))
 }
 
 /// Write `rows` to a fresh CSV at `path`, header first. The output path is
@@ -316,11 +316,13 @@ fn collect_data(
     stats_map: &HashMap<i32, RefCell<TaskStats>>,
     output: &str,
     min_events: u64,
+    game_ppid: i32,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter_map(|(&tid, cell)| {
-            let ts = cell.borrow();
+            let mut ts = cell.borrow_mut();
             if ts.exit == 0 && ts.event_count >= min_events {
+                climb_to_root(&mut ts, stats_map, game_ppid);
                 Some((tid, task_csv_row(tid, &ts)))
             } else {
                 None
@@ -362,6 +364,24 @@ fn climb_one_step(
     // kthreadd / swapper). Fold to 1 so the climb has a single non-game
     // root.
     ts.ancestor = if new_a == 0 { 1 } else { new_a };
+}
+
+/// Climb `ts.ancestor` to a root (1 or `game_ppid`) in one call, for
+/// `collect_data` which runs once and can't converge over cycles. The step
+/// cap guards against a cycle in the ancestor pointers.
+fn climb_to_root(
+    ts: &mut TaskStats,
+    stats_map: &HashMap<i32, RefCell<TaskStats>>,
+    game_ppid: i32,
+) {
+    const MAX_STEPS: usize = 4096;
+    for _ in 0..MAX_STEPS {
+        if ts.ancestor == 1 || (game_ppid != 0 && ts.ancestor == game_ppid) {
+            return;
+        }
+        climb_one_step(ts, stats_map, game_ppid);
+    }
+    ts.ancestor = 1;
 }
 
 /// Run one classify cycle: predict each eligible task's cluster and write the
@@ -602,7 +622,8 @@ fn main() -> Result<()> {
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
-                let n = collect_data(&stats.borrow(), &args.output, args.min_events)?;
+                let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
+                let n = collect_data(&stats.borrow(), &args.output, args.min_events, game_ppid)?;
                 log!(logger, "CSV written: {} rows", n);
             }
 
@@ -625,7 +646,8 @@ fn main() -> Result<()> {
 
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
-        let n = collect_data(&stats.borrow(), &args.output, args.min_events)?;
+        let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
+        let n = collect_data(&stats.borrow(), &args.output, args.min_events, game_ppid)?;
         log!(logger, "CSV written: {} rows", n);
     }
 
