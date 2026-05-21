@@ -25,9 +25,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead};
+use std::os::raw::c_int;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Condvar, Mutex};
 
 // ===========================================================================
 // Scanning
@@ -198,10 +198,11 @@ pub fn steam_scan_proc() -> Option<Match> {
 // Watch loop (stdin + periodic timer, multiplexed via select(2))
 // ===========================================================================
 
-/// Minimal FFI: just enough of select(2) to multiplex one fd with a timeout,
-/// so this module needs no `libc` crate.
+/// Minimal FFI: select(2) for multiplexing stdin + the wake eventfd, and
+/// the eventfd(2) / read / write / close syscalls used for the wake
+/// channel. No `libc` crate dependency.
 mod ffi {
-    use std::os::raw::c_int;
+    use std::os::raw::{c_int, c_uint, c_void};
 
     /// `fd_set` on Linux is a bitmask of `FD_SETSIZE` (1024) bits.
     const FD_SETSIZE: usize = 1024;
@@ -228,10 +229,30 @@ mod ffi {
         }
     }
 
+    /// `EFD_CLOEXEC` from <sys/eventfd.h> — keep the wake fd from leaking
+    /// across exec(). Value is the same as `O_CLOEXEC` on Linux.
+    pub const EFD_CLOEXEC: c_int = 0o2000000;
+
+    /// `CLOCK_MONOTONIC` from <time.h>. Used for timerfd; immune to
+    /// wall-clock jumps (NTP / hibernate resume).
+    pub const CLOCK_MONOTONIC: c_int = 1;
+    /// `TFD_CLOEXEC` from <sys/timerfd.h>. Same value as O_CLOEXEC.
+    pub const TFD_CLOEXEC: c_int = 0o2000000;
+
+    /// `struct timespec`. Matches the kernel layout on 64-bit Linux.
     #[repr(C)]
-    pub struct Timeval {
+    pub struct Timespec {
         pub tv_sec: i64,
-        pub tv_usec: i64,
+        pub tv_nsec: i64,
+    }
+
+    /// `struct itimerspec` — initial expiration + repeating interval. The
+    /// timerfd we set up here is a recurring tick, so both fields are the
+    /// same duration. A zero-valued `it_value` disarms the timer.
+    #[repr(C)]
+    pub struct ITimerspec {
+        pub it_interval: Timespec,
+        pub it_value: Timespec,
     }
 
     extern "C" {
@@ -240,7 +261,20 @@ mod ffi {
             readfds: *mut FdSet,
             writefds: *mut FdSet,
             exceptfds: *mut FdSet,
-            timeout: *mut Timeval,
+            timeout: *mut c_void, // NULL = block forever; we never pass non-NULL
+        ) -> c_int;
+
+        pub fn eventfd(initval: c_uint, flags: c_int) -> c_int;
+        pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+        pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        pub fn close(fd: c_int) -> c_int;
+
+        pub fn timerfd_create(clockid: c_int, flags: c_int) -> c_int;
+        pub fn timerfd_settime(
+            fd: c_int,
+            flags: c_int,
+            new_value: *const ITimerspec,
+            old_value: *mut ITimerspec,
         ) -> c_int;
     }
 }
@@ -251,11 +285,16 @@ mod ffi {
 
 /// State shared between the scan thread and the scheduler thread.
 ///
-/// The two atomics are the only fields the scheduler's hot path touches, so
-/// it never blocks: it `load`s `game_ppid` and, for a dying game process,
-/// `fetch_sub`s `alive_count`. The `Mutex`/`Condvar` pair exists only so the
-/// scan thread can sleep while a game runs and be woken when it ends — the
-/// scheduler locks the mutex for the single instant it sends that notify.
+/// `game_ppid` / `alive_count` are atomics so the scheduler's hot path is
+/// lock-free. The wake channel is an `eventfd(2)`: the scheduler writes a
+/// non-zero u64 to wake the scan thread, the scan thread reads to clear,
+/// and `select(2)` can multiplex it with stdin so the scan thread can wait
+/// for either a user-typed game name OR a scheduler-side notification on
+/// the same call.
+///
+/// Wake reasons are not encoded in the eventfd value — the scan thread,
+/// on every wake, just re-examines `game_ppid` and the shutdown flag to
+/// decide what to do.
 pub struct GameTracker {
     /// Common parent PID of the currently tracked game's process family.
     /// 0 means no game is tracked (the scan thread is actively scanning).
@@ -263,25 +302,51 @@ pub struct GameTracker {
     /// Number of the tracked game's processes still alive. When it reaches 0
     /// the game is considered ended and the scan thread is woken.
     pub alive_count: AtomicI32,
-    /// `wake` flips to true to release the scan thread from `wait_for_game_end`
-    /// — set both when the game ends and on shutdown.
-    wake: Mutex<bool>,
-    wake_cv: Condvar,
+    /// eventfd used to wake the scan thread from a blocking `select(2)`.
+    /// Owned by the tracker; closed in `Drop`.
+    wake_fd: c_int,
 }
 
 impl GameTracker {
     pub fn new() -> Self {
+        // SAFETY: ffi call; EFD_CLOEXEC is a valid flag. A negative return
+        // would mean we cannot create an eventfd, which is fatal for the
+        // game-tracking machinery — panic with errno preserved by the OS
+        // error message rather than silently degrading.
+        let fd = unsafe { ffi::eventfd(0, ffi::EFD_CLOEXEC) };
+        if fd < 0 {
+            panic!("eventfd(2) failed: {}", io::Error::last_os_error());
+        }
         GameTracker {
             game_ppid: AtomicI32::new(0),
             alive_count: AtomicI32::new(0),
-            wake: Mutex::new(false),
-            wake_cv: Condvar::new(),
+            wake_fd: fd,
         }
     }
 
     /// True while a game is being tracked (set by the scan thread on a match).
     pub fn is_tracking(&self) -> bool {
         self.game_ppid.load(Ordering::Acquire) != 0
+    }
+
+    /// Raw fd of the wake eventfd. The scan thread passes it to `select(2)`.
+    pub(crate) fn wake_fd(&self) -> c_int {
+        self.wake_fd
+    }
+
+    /// Drain the eventfd after `select(2)` reported it readable. eventfd is
+    /// a counter; one read returns and zeroes the accumulated value, so a
+    /// burst of wakes coalesces into one wake-up — which is exactly what we
+    /// want (we re-examine state on wake, not the count).
+    pub(crate) fn consume_wake(&self) {
+        let mut buf = [0u8; 8];
+        // SAFETY: ffi call with a valid pointer and length; we ignore the
+        // return value (EAGAIN can't happen on a blocking eventfd that
+        // select(2) just reported ready; any other error means the kernel
+        // is in trouble and we'll find out on the next syscall).
+        unsafe {
+            ffi::read(self.wake_fd, buf.as_mut_ptr() as *mut _, buf.len());
+        }
     }
 
     /// Called by the scheduler thread when a tracked game process exits:
@@ -306,35 +371,46 @@ impl GameTracker {
         }
     }
 
-    /// Scan thread: the tracked game has truly ended (a re-scan found nothing).
-    /// Clear the tracked PPID so the next loop iteration scans afresh.
-    fn clear(&self) {
+    /// Clear the tracked PPID so the scan thread will scan afresh next time
+    /// it inspects `game_ppid`. Callable from either thread; the scheduler
+    /// uses it when it sees the game's own PPID exit (process_event), the
+    /// scan thread uses it after a re-scan confirms the game is gone.
+    pub fn clear(&self) {
         self.game_ppid.store(0, Ordering::Release);
     }
 
-    /// Wake the scan thread out of `wait_for_game_end`. Used both for "game
-    /// ended" and for shutdown.
+    /// Wake the scan thread out of `select(2)`. Writing 1 onto the eventfd
+    /// counter wakes any reader; the scan thread re-examines state and
+    /// decides what to do.
     pub fn signal_wake(&self) {
-        let mut woken = self.wake.lock().unwrap();
-        *woken = true;
-        self.wake_cv.notify_all();
+        let one: u64 = 1;
+        // SAFETY: ffi call with a valid pointer / length; return value can
+        // be ignored — a failed write here just means the scan thread will
+        // not wake right now, and the next signal_wake or any other wake
+        // event will cover it.
+        unsafe {
+            ffi::write(
+                self.wake_fd,
+                &one as *const u64 as *const _,
+                std::mem::size_of::<u64>(),
+            );
+        }
     }
 
-    /// Scan thread: record a freshly detected game and block until it ends
-    /// (or shutdown). `procs` is the game's process family from a scan.
-    fn track_and_wait(&self, ppid: i32, proc_count: i32) {
+    /// Scan thread: record a freshly detected game. No longer blocks here —
+    /// the watch loop drives all blocking via `select(2)` on the eventfd.
+    fn track(&self, ppid: i32, proc_count: i32) {
         self.alive_count.store(proc_count, Ordering::Release);
         self.game_ppid.store(ppid, Ordering::Release);
-        self.wait_for_game_end();
     }
+}
 
-    /// Block the scan thread until `signal_wake` is called.
-    fn wait_for_game_end(&self) {
-        let mut woken = self.wake.lock().unwrap();
-        while !*woken {
-            woken = self.wake_cv.wait(woken).unwrap();
+impl Drop for GameTracker {
+    fn drop(&mut self) {
+        if self.wake_fd >= 0 {
+            // SAFETY: ffi call on a fd we own and are about to forget.
+            unsafe { ffi::close(self.wake_fd); }
         }
-        *woken = false;
     }
 }
 
@@ -346,7 +422,9 @@ impl Default for GameTracker {
 
 /// Configuration for the watch loop.
 pub struct WatchConfig {
-    /// How often the environment-based Steam scan runs, in seconds.
+    /// Period of the recurring environment-scan tick, in seconds. Only
+    /// applies in the scan state; while a game is tracked the timer is not
+    /// watched. Set to 0 to disable the periodic tick entirely.
     pub scan_interval_secs: i64,
 }
 
@@ -363,35 +441,106 @@ impl Default for WatchConfig {
 pub enum Trigger {
     /// A game name typed on stdin triggered a comm-based scan.
     GameName(String),
-    /// The periodic timer triggered an environment-based Steam scan.
+    /// A wake from the scheduler thread triggered an environment-based scan.
     Timer,
 }
 
-/// Block until stdin is readable or `timeout_secs` elapses.
-/// Returns true if stdin is readable, false on timeout or on an error
-/// (an error is treated as a timeout so the loop performs a periodic scan
-/// rather than spinning).
-fn wait_for_stdin(stdin_fd: i32, timeout_secs: i64) -> bool {
+/// Block until any of stdin, wake_fd, or timer_fd is readable. Returns
+/// `(stdin, wake, timer)` readiness flags. No timeout — the timerfd is
+/// what produces periodic ticks; everything else is event-driven.
+///
+/// A negative `timer_fd` means no timer is armed (when `scan_interval_secs
+/// == 0`); we skip registering it.
+fn select_scan_fds(stdin_fd: c_int, wake_fd: c_int, timer_fd: c_int) -> (bool, bool, bool) {
     let mut readfds = ffi::FdSet::new();
     readfds.set(stdin_fd);
-    let mut timeout = ffi::Timeval {
-        tv_sec: timeout_secs,
-        tv_usec: 0,
-    };
+    readfds.set(wake_fd);
+    if timer_fd >= 0 {
+        readfds.set(timer_fd);
+    }
+    let nfds = stdin_fd.max(wake_fd).max(timer_fd) + 1;
 
-    // SAFETY: readfds and timeout are valid, correctly sized, and outlive the
-    // call; nfds = stdin_fd + 1 covers the single fd we registered.
+    // SAFETY: readfds outlives the call; NULL timeout blocks until a
+    // watched fd becomes readable or a signal interrupts. EINTR returns
+    // negative with no fd set, treated as a spurious wake.
     let ret = unsafe {
         ffi::select(
-            stdin_fd + 1,
+            nfds,
             &mut readfds,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut timeout,
+            std::ptr::null_mut(),
         )
     };
 
-    ret > 0 && readfds.is_set(stdin_fd)
+    if ret <= 0 {
+        return (false, false, false);
+    }
+    (
+        readfds.is_set(stdin_fd),
+        readfds.is_set(wake_fd),
+        timer_fd >= 0 && readfds.is_set(timer_fd),
+    )
+}
+
+/// Create a recurring timerfd ticking every `interval_secs` seconds, on
+/// CLOCK_MONOTONIC. Returns -1 if `interval_secs == 0` (caller treats as
+/// "no timer") or on syscall failure (degrade to no-tick rather than
+/// abort the whole watch loop).
+fn arm_scan_timer(interval_secs: i64) -> c_int {
+    if interval_secs <= 0 {
+        return -1;
+    }
+    // SAFETY: ffi syscall.
+    let fd = unsafe { ffi::timerfd_create(ffi::CLOCK_MONOTONIC, ffi::TFD_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("timerfd_create failed: {}", io::Error::last_os_error());
+        return -1;
+    }
+    let spec = ffi::ITimerspec {
+        it_interval: ffi::Timespec { tv_sec: interval_secs, tv_nsec: 0 },
+        // First tick fires almost immediately so a game that's already
+        // running at scheduler startup gets picked up without waiting a
+        // full interval. 1 ns is the smallest non-zero (zero would disarm).
+        it_value:    ffi::Timespec { tv_sec: 0, tv_nsec: 1 },
+    };
+    // SAFETY: spec is valid for the call's duration; old_value NULL is fine.
+    let rc = unsafe { ffi::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) };
+    if rc < 0 {
+        eprintln!("timerfd_settime failed: {}", io::Error::last_os_error());
+        // SAFETY: fd was a successful timerfd_create.
+        unsafe { ffi::close(fd); }
+        return -1;
+    }
+    fd
+}
+
+/// Drain a ready timerfd. Reading returns the number of expirations since
+/// last read as a u64; the value is uninteresting, we just clear the fd
+/// so select(2) stops reporting it immediately ready.
+fn consume_timer(timer_fd: c_int) {
+    let mut buf = [0u8; 8];
+    // SAFETY: ffi call, valid buffer.
+    unsafe {
+        ffi::read(timer_fd, buf.as_mut_ptr() as *mut _, buf.len());
+    }
+}
+
+/// Block on the wake eventfd only (used while a game is being tracked, so
+/// stdin is ignored until the game ends). Returns when the eventfd fires.
+fn wait_for_wake(wake_fd: c_int) {
+    let mut readfds = ffi::FdSet::new();
+    readfds.set(wake_fd);
+    // SAFETY: see select_stdin_or_wake.
+    unsafe {
+        ffi::select(
+            wake_fd + 1,
+            &mut readfds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
 }
 
 /// Re-run the scan that originally found a game, to confirm it is still
@@ -404,22 +553,25 @@ fn rescan(trigger: &Trigger) -> Option<Match> {
     }
 }
 
-/// Run the stdin + periodic-timer watch loop with dynamic game tracking.
+/// Run the watch loop with dynamic game tracking.
 ///
-/// While no game is tracked the loop waits up to `cfg.scan_interval_secs` for
-/// a line on stdin: a line triggers a `scan_by_game_name`, a timeout triggers
-/// a `steam_scan_proc`. On a successful scan it invokes `on_match`, records
-/// the game in `tracker`, then **sleeps** until the scheduler thread reports
-/// (via `tracker`) that the game's alive process count hit zero.
+/// Two states, distinguished by `tracker.game_ppid`:
 ///
-/// That zero is only a hint, not proof the game ended: the count is a
-/// snapshot from detection time, so a game shedding threads (a cutscene load,
-/// say) can reach zero while still running. So on wake the loop **re-scans**:
-/// if the game is still found it is silently re-tracked (no notice printed);
-/// only if the re-scan finds nothing is the game declared ended.
+/// - `game_ppid == 0` — scan state. Block on `select(2)` over stdin, the
+///   wake eventfd, and the periodic scan timerfd. A stdin line triggers
+///   `scan_by_game_name`; a timer tick or scheduler-side wake triggers
+///   `steam_scan_proc`. Catching the timerfd here is what makes the
+///   "scheduler started while the game is already running" case work —
+///   nothing else will wake us, so we tick ourselves.
+/// - `game_ppid != 0` — tracking state. Block on the wake eventfd only;
+///   the timer is not watched while tracking. On wake, either the
+///   scheduler reported the alive count hit zero (a transient drop —
+///   confirm by re-scanning) or the game's own PPID exit was caught
+///   (process_event cleared game_ppid, so we see 0 here and fall back
+///   into the scan state silently).
 ///
-/// The loop also exits when `shutdown` is set; the caller is expected to set
-/// it and then call `tracker.signal_wake()` so a sleeping scan thread wakes.
+/// Shutdown: `shutdown.store(true)` + `tracker.signal_wake()`. The scan
+/// thread checks `shutdown` on every loop iteration.
 ///
 /// `on_match` carries all output/side-effect policy, so this loop stays
 /// reusable: pass a closure that does whatever you need.
@@ -431,57 +583,105 @@ pub fn watch(
 ) {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_raw_fd();
+    let wake_fd = tracker.wake_fd();
+    let timer_fd = arm_scan_timer(cfg.scan_interval_secs);
+
+    // Track the most recent trigger so a tracking-state wake can re-scan
+    // via the same lookup method that originally found the game.
+    let mut last_trigger: Option<Trigger> = None;
 
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        // Scan for a game: either a name typed on stdin, or the periodic
-        // environment scan on timeout.
-        let found = if wait_for_stdin(stdin_fd, cfg.scan_interval_secs) {
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => break, // EOF (Ctrl-D)
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("stdin read error: {e}");
+        if tracker.game_ppid.load(Ordering::Acquire) == 0 {
+            // ---- scan state ----
+            let (stdin_ready, wake_ready, timer_ready) =
+                select_scan_fds(stdin_fd, wake_fd, timer_fd);
+
+            if wake_ready {
+                tracker.consume_wake();
+                if shutdown.load(Ordering::Acquire) {
                     break;
                 }
             }
-            let name = line.trim().to_string();
-            if name.is_empty() {
-                continue;
+            if timer_ready {
+                consume_timer(timer_fd);
             }
-            scan_by_game_name(&name).map(|m| (Trigger::GameName(name), m))
+
+            // Either the periodic timer or a scheduler-side wake should
+            // run the environment scan. (Right now the scheduler doesn't
+            // emit wakes while game_ppid==0, but if a future caller does,
+            // the right reaction is "re-scan", same as the timer tick.)
+            if (timer_ready || wake_ready) && !shutdown.load(Ordering::Acquire) {
+                if let Some(m) = steam_scan_proc() {
+                    on_match(Trigger::Timer, &m);
+                    tracker.track(m.ppid, m.procs.len() as i32);
+                    last_trigger = Some(Trigger::Timer);
+                }
+            }
+
+            if stdin_ready {
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) => break, // EOF (Ctrl-D)
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("stdin read error: {e}");
+                        break;
+                    }
+                }
+                let name = line.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(m) = scan_by_game_name(&name) {
+                    let trigger = Trigger::GameName(name);
+                    on_match(trigger.clone(), &m);
+                    tracker.track(m.ppid, m.procs.len() as i32);
+                    last_trigger = Some(trigger);
+                }
+            }
         } else {
-            steam_scan_proc().map(|m| (Trigger::Timer, m))
-        };
+            // ---- tracking state ----
+            // The wake fd is the only thing that pulls us out of here.
+            // Wakes mean: alive count hit zero (transient cutscene drop —
+            // confirm by re-scanning) OR game PPID exited (process_event
+            // cleared game_ppid; we'll see 0 next iteration and switch
+            // back to scan state) OR shutdown.
+            wait_for_wake(wake_fd);
+            tracker.consume_wake();
 
-        let Some((trigger, mut m)) = found else {
-            continue;
-        };
-        on_match(trigger.clone(), &m);
-
-        // Track the game and sleep; on each wake, re-scan to tell a real exit
-        // from a transient drop to zero. Stay in this inner loop, silently
-        // re-tracking, until a re-scan finds nothing (or shutdown).
-        loop {
-            tracker.track_and_wait(m.ppid, m.procs.len() as i32);
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
-            match rescan(&trigger) {
-                // Still running — a transient zero (e.g. cutscene). Re-track
-                // quietly; the user never sees this.
-                Some(again) => m = again,
+            // If game_ppid was cleared (PPID exited path), do nothing
+            // here — the next loop iteration enters scan state and
+            // continues. Otherwise, re-scan to disambiguate transient
+            // zero vs real exit.
+            if tracker.game_ppid.load(Ordering::Acquire) == 0 {
+                println!("[game] Game appears to have ended — you can type a game/task name to add one.");
+                continue;
+            }
+            let Some(trigger) = last_trigger.as_ref() else {
+                continue;
+            };
+            match rescan(trigger) {
+                // Still running — a transient zero (e.g. cutscene).
+                // Re-track quietly; the user never sees this.
+                Some(again) => tracker.track(again.ppid, again.procs.len() as i32),
                 // Re-scan found nothing: the game has truly ended.
                 None => {
                     tracker.clear();
                     println!("[game] Game appears to have ended — you can type a game/task name to add one.");
-                    break;
                 }
             }
         }
+    }
+
+    if timer_fd >= 0 {
+        // SAFETY: we own this fd and the loop is done with it.
+        unsafe { ffi::close(timer_fd); }
     }
 }

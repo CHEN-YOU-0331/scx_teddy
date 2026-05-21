@@ -224,17 +224,22 @@ fn process_event(
             .or_insert_with(|| RefCell::new(TaskStats::new(initial_ancestor)));
         cell.borrow_mut().update(event);
     } else if event.parent == -1 {
-        // A task exited. If by now its Union-Find ancestor has collapsed to
-        // the tracked game's PPID, it was a game task — tell the tracker to
-        // decrement the alive count and wake the scan thread on zero.
+        // A task exited. Two game-detection consequences:
         //
-        // process_event and run_classify_cycle run on the same thread so
-        // there is no race: by the time an exit lands here, any climbing
-        // done for this tid is already committed to `ancestor`. If the
-        // ancestor hasn't collapsed to game_ppid yet, it wasn't classified
-        // as a game task and shouldn't be counted toward the game family,
-        // which is exactly what note_process_exit's `== game_ppid` check
-        // enforces.
+        // 1. If the dying task IS the tracked game's PPID, the game ended
+        //    for real — clear the tracker and wake the scan thread. This
+        //    is the reliable signal; the alive-count path below depends on
+        //    the ancestor having converged via climb_one_step and on every
+        //    game-family task actually firing an exit event, neither of
+        //    which is guaranteed in time.
+        // 2. Otherwise, if the ancestor has converged to the tracked PPID,
+        //    decrement the alive count as a fallback signal (transient
+        //    cutscene drops still go through here).
+        let tracked = tracker.game_ppid.load(Ordering::Acquire);
+        if tracked != 0 && event.tid == tracked {
+            tracker.clear();
+            tracker.signal_wake();
+        }
         if let Some(cell) = stats.get(&event.tid) {
             let mut ts = cell.borrow_mut();
             ts.exit = 1;
