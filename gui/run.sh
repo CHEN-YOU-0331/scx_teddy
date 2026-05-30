@@ -22,9 +22,15 @@ else
 fi
 
 cd "$HERE"
-# --server.headless silences the "would you like to share email" prompt;
-# the dashboard opens in the default browser via streamlit's own logic.
+# Streamlit flags:
+#   --server.headless true     don't auto-launch a browser tab; user keeps
+#                              their already-open one and just hits reload.
+#                              (Was opening Chrome on every restart before.)
+#   --browser.serverAddress    avoid the "where is the server?" prompt.
+#   --browser.gatherUsageStats false   no telemetry.
+#   --theme.base dark          force dark theme.
 exec "$PY" -m streamlit run app.py \
     --server.headless true \
+    --browser.serverAddress localhost \
     --browser.gatherUsageStats false \
     --theme.base dark

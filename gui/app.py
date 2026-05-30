@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "_mock_stash"))
 from tabs import collect as page_collect  # noqa: E402
 from tabs import train as page_train  # noqa: E402
 from tabs import static_tsne as page_static_tsne  # noqa: E402
+from tabs import overall as page_overall  # noqa: E402
 
 
 # -----------------------------------------------------------------------------
@@ -146,10 +147,11 @@ MOCK_TABS_ENABLED = False
 if MOCK_TABS_ENABLED:
     # Late, dynamic imports so a missing _mock_stash doesn't break the main
     # app and so static analysers don't warn about a path-injected module.
+    # Note: Overall is the *real* tab below — the mock Overall is retired
+    # now that the real one works. Only Per-task / Cluster still need mocks.
     import time
     import importlib
     mock_data = importlib.import_module("mock_data")
-    overall_page = importlib.import_module("_mock_stash.overall_page")
     per_task_page = importlib.import_module("_mock_stash.per_task_page")
     cluster_page = importlib.import_module("_mock_stash.cluster_page")
 
@@ -166,17 +168,15 @@ if MOCK_TABS_ENABLED:
     (tab_collect, tab_train, tab_static,
      tab_overall, tab_per, tab_cluster) = st.tabs([
         "📥 Collect", "🧠 Train", "🗺 Static t-SNE",
-        "📊 Overall", "🔬 Per-task", "✨ Cluster (live)",
+        "📊 Overall", "🔬 Per-task (mock)", "✨ Cluster (mock)",
     ])
-    with tab_overall:
-        overall_page.render(mock)
     with tab_per:
         per_task_page.render(mock)
     with tab_cluster:
         cluster_page.render(mock)
 else:
-    tab_collect, tab_train, tab_static = st.tabs([
-        "📥 Collect", "🧠 Train", "🗺 Static t-SNE",
+    tab_collect, tab_train, tab_static, tab_overall = st.tabs([
+        "📥 Collect", "🧠 Train", "🗺 Static t-SNE", "📊 Overall",
     ])
 
 with tab_collect:
@@ -185,6 +185,8 @@ with tab_train:
     page_train.render()
 with tab_static:
     page_static_tsne.render()
+with tab_overall:
+    page_overall.render()
 
 
 # -----------------------------------------------------------------------------
@@ -204,6 +206,16 @@ def _any_proc_running() -> bool:
     return False
 
 
-if _any_proc_running() or MOCK_TABS_ENABLED:
-    _time.sleep(1.0 if MOCK_TABS_ENABLED else 1.5)
+def _overall_active() -> bool:
+    """Has the Overall tab been opened this session? Once it has, we keep
+    nudging reruns so its sparklines / per-CPU strip animate. Streamlit
+    doesn't tell us which tab is *currently* visible, so this is a
+    pragmatic approximation: the cost of a rerun when the user is on
+    another tab is one extra script pass — cheap, no flicker, the other
+    tabs are idempotent."""
+    return "overall_sampler" in st.session_state
+
+
+if _any_proc_running() or MOCK_TABS_ENABLED or _overall_active():
+    _time.sleep(1.0 if (MOCK_TABS_ENABLED or _overall_active()) else 1.5)
     st.rerun()
