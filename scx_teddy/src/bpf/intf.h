@@ -17,24 +17,19 @@ typedef signed long s64;
 #define MODE_TID    0  
 #define MODE_TGID   1
 
-#define CRITICAL_DSQ 200
-#define INTERACTIVE_DSQ 201
-#define NORMAL_DSQ 202
-#define OTHER_DSQ 203
-#define CRITICAL_WAKEUP_DSQ 204
-#define INTERACTIVE_WAKEUP_DSQ 205
-
-#define DSQ_NUM 6
+#define DSQ_BASE 200
+#define PRIORITY_NUM 12
+#define CRITICAL_PRIO 4 // prio < 4 is critical
+#define DEFAULT_PRIO 11 // use lowest priority as default
 
 #define DEFAULT_SLICE 100 * 1000
 
-#define TIER_CRITICAL 0
-#define TIER_INTERACTIVE 1
-#define TIER_NORMAL 2
-#define TIER_BATCH 3
-
 /* Upper bound on logical CPUs for the topology arrays below. */
 #define MAX_CPU 255
+
+/* Upper bound on distinct CPU kinds (freq tiers). A compile-time cap is needed
+ * to bound the DSQ-creation loop for the verifier; real hardware has 1-3. */
+#define MAX_CPU_KIND 8
 
 /* Per-CPU topology */
 typedef struct cpu_info {
@@ -45,6 +40,7 @@ typedef struct cpu_info {
 
 typedef struct task_info {
     s32 prio; // 0, 1, 2, 3
+    u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
     u64 slice; // ns
 } sched_info_t;
 
@@ -53,6 +49,7 @@ typedef struct target_ctx {
     u64 slice; // ns
     u8 config;
     /* | 7 bits NOP | 1 bits ecore |*/
+    u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
     u64 start_running;
     u64 sleep_start;
     u64 sleep_end;

@@ -56,6 +56,11 @@ enum SliceConfig {
 #[derive(Debug, Deserialize, Clone)]
 struct ClusterSchedConfig {
     prio: i32,
+    /// DSQ slot / CPU-kind binding (1-based; 1 = fastest kind). 0 (the default
+    /// when omitted) means the shared DSQ — runnable on any CPU kind. A value
+    /// of `k` pins the cluster's tasks to the kind-only DSQ for kind `k`.
+    #[serde(default)]
+    cpu_kind: u8,
     #[serde(flatten)]
     slice: SliceConfig,
 }
@@ -444,11 +449,12 @@ fn run_classify_cycle(
         let prio = cluster_cfg.prio;
         let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
 
-        // Write sched_info_t {prio: s32, slice: u64} to update_map
-        // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
+        // Write sched_info_t {prio: s32, kind: u8, slice: u64} to update_map.
+        // C layout (8-byte aligned): prio[0..4] | kind[4] | pad[5..8] | slice[8..16]
         let tid_key = tid.to_ne_bytes();
         let mut val_buf = [0u8; 16];
         val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
+        val_buf[4] = cluster_cfg.cpu_kind;
         val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
         update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
     }
@@ -469,6 +475,28 @@ fn run_classify_cycle(
             .unwrap_or(&cfg.default);
         log!(logger, "  Cluster {} (prio={}, {} tasks)",
             i, cluster_cfg.prio, tids.len());
+    }
+    Ok(())
+}
+
+/// Reject any cluster (or the default) whose `cpu_kind` exceeds the machine's
+/// kind count. Valid range is `0..=cpu_kind_num` (0 = shared / any kind, 1 =
+/// fastest kind). A binding to a non-existent kind would put tasks in a DSQ no
+/// CPU pulls from, starving them — so fail loudly at startup instead.
+fn validate_config_kinds(cfg: &SchedConfig, cpu_kind_num: u8) -> Result<()> {
+    let check = |name: &str, c: &ClusterSchedConfig| -> Result<()> {
+        if c.cpu_kind > cpu_kind_num {
+            anyhow::bail!(
+                "config {}: cpu_kind={} exceeds this machine's {} kind(s) \
+                 (valid: 0=shared, 1..={})",
+                name, c.cpu_kind, cpu_kind_num, cpu_kind_num
+            );
+        }
+        Ok(())
+    };
+    check("default", &cfg.default)?;
+    for (k, c) in &cfg.clusters {
+        check(&format!("cluster {k}"), c)?;
     }
     Ok(())
 }
@@ -560,7 +588,17 @@ fn main() -> Result<()> {
     // BPF rodata consts before load, so the verifier sees them as constants.
     let topo = topology::Topology::discover();
     log!(logger, "topology: {}", topo.summary());
+    // Surface the kind count on stdout so a user writing config.json knows the
+    // valid cpu_kind range (1..=cpu_kind_num; 0 = shared).
+    println!("[topology] {}", topo.summary());
     pack_topology(&mut open_skel, &topo);
+
+    // Reject configs that bind a cluster to a CPU kind this machine doesn't
+    // have, before load — otherwise those tasks land in a DSQ that no CPU ever
+    // pulls from and starve.
+    if let Some(cfg) = &sched_config {
+        validate_config_kinds(cfg, topo.cpu_kind_num)?;
+    }
 
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
 

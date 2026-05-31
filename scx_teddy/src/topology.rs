@@ -31,7 +31,9 @@ pub const MAX_CPU: usize = 512;
 /// Per-CPU topology entry, mirrors `cpu_info_t` in intf.h.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuInfo {
-    /// 0 = fastest kind.
+    /// 1-based kind id; 1 = fastest kind. 0 is reserved (it maps to the
+    /// shared DSQ slot on the BPF side) and only appears on unfilled gap
+    /// entries (offline / missing cpu ids).
     pub cpu_kind: u8,
     /// This CPU's max_freq (kHz).
     pub freq_n: u32,
@@ -136,7 +138,9 @@ impl Topology {
         if freq_by_cpu.is_empty() {
             let n = fallback_cpu_count().min(MAX_CPU as u32);
             let cpus: Vec<u8> = (0..n as u8).collect();
-            let cpu_info = vec![CpuInfo { cpu_kind: 0, freq_n: 1, freq_d: 1 }; n as usize];
+            // kind is 1-based (see CpuInfo::cpu_kind): the one kind is 1, so
+            // DSQ slot 0 stays reserved for the shared (any-kind) queue.
+            let cpu_info = vec![CpuInfo { cpu_kind: 1, freq_n: 1, freq_d: 1 }; n as usize];
             let mut slow = cpus.clone();
             slow.reverse();
             return Topology {
@@ -148,12 +152,14 @@ impl Topology {
             };
         }
 
-        // Distinct max_freqs, sorted high → low: index = kind id (0 = fastest).
+        // Distinct max_freqs, sorted high → low. kind is 1-based: the fastest
+        // freq is kind 1, the next kind 2, etc. DSQ slot 0 is reserved for the
+        // shared (any-kind) queue, so real CPU kinds start at 1.
         let mut freqs: Vec<u32> = freq_by_cpu.values().copied().collect();
         freqs.sort_unstable_by(|a, b| b.cmp(a));
         freqs.dedup();
         let kind_of_freq: BTreeMap<u32, u8> =
-            freqs.iter().enumerate().map(|(i, &f)| (f, i as u8)).collect();
+            freqs.iter().enumerate().map(|(i, &f)| (f, i as u8 + 1)).collect();
         let fastest = *freqs.first().expect("non-empty after is_empty check");
 
         // cpu_info indexed by cpu id. Size to highest cpu id + 1 so direct
