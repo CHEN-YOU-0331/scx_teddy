@@ -33,6 +33,16 @@ typedef signed long s64;
 #define TIER_NORMAL 2
 #define TIER_BATCH 3
 
+/* Upper bound on logical CPUs for the topology arrays below. */
+#define MAX_CPU 255
+
+/* Per-CPU topology */
+typedef struct cpu_info {
+    u8 cpu_kind;  // 0 = fastest kind
+    u32 freq_n;   // numerator   = this CPU's max_freq (kHz)
+    u32 freq_d;   // denominator = fastest CPU's max_freq (kHz)
+} cpu_info_t;
+
 typedef struct task_info {
     s32 prio; // 0, 1, 2, 3
     u64 slice; // ns

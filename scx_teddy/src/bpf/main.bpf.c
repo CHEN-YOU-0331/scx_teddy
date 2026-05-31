@@ -11,6 +11,16 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+/* CPU topology, filled by userspace (topology.rs) into rodata before load. */
+const volatile u8 cpu_num;       // number of online logical CPUs in use
+const volatile u8 cpu_kind_num;  // number of distinct freq kinds (>= 1)
+/* CPUs sorted by speed. cpus_fast_to_slow[0] is the fastest CPU id;
+ * cpus_slow_to_fast is the reverse. Only the first `cpu_num` entries are set. */
+const volatile u8 cpus_fast_to_slow[MAX_CPU];
+const volatile u8 cpus_slow_to_fast[MAX_CPU];
+/* Indexed by logical CPU id. */
+const volatile cpu_info_t cpu_info[MAX_CPU];
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -187,6 +197,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(teddy_init)
             return ret;
     }
 
+    /* Dump the topology rodata filled by userspace (topology.rs), visible via
+     * `cat /sys/kernel/debug/tracing/trace_pipe`. Loops are bounded by MAX_CPU
+     * (compile-time) for the verifier and broken early at cpu_num. */
+    bpf_printk("teddy topo: cpu_num=%u cpu_kind_num=%u", cpu_num, cpu_kind_num);
+    for (u32 i = 0; i < MAX_CPU; i++) {
+        if (i >= cpu_num)
+            break;
+        bpf_printk("teddy topo: cpu%u kind=%u freq=%u/%u",
+                   i, cpu_info[i].cpu_kind, cpu_info[i].freq_n, cpu_info[i].freq_d);
+    }
+    for (u32 i = 0; i < MAX_CPU; i++) {
+        if (i >= cpu_num)
+            break;
+        bpf_printk("teddy topo: order[%u] fast_to_slow=%u slow_to_fast=%u",
+                   i, cpus_fast_to_slow[i], cpus_slow_to_fast[i]);
+    }
+
     return 0;
 }
 
@@ -234,7 +261,22 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
-    target_ctx->runtime_ns += now - target_ctx->start_running;
+    
+    u64 now_runtime = now - target_ctx->start_running;
+    /* Normalize CPU frequency differences between big and little cores 
+     * to avoid overestimating task load when tasks are executed on little 
+     * cores.*/
+    {
+        u32 cpu = bpf_get_smp_processor_id();
+        u64 freq_n = cpu_info[cpu].freq_n;
+        u64 freq_d = cpu_info[cpu].freq_d;
+        if (freq_n != freq_d) {
+            now_runtime *= freq_n;
+            now_runtime /= freq_d;
+        }
+    }
+
+    target_ctx->runtime_ns += now_runtime;
     target_ctx->in_iowait_cnt += p->in_iowait;
 
     if (!runnable) {

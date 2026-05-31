@@ -26,6 +26,7 @@ use libbpf_rs::MapFlags;
 mod classifier;
 mod task_stats;
 mod game_task_finder;
+mod topology;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
@@ -472,6 +473,35 @@ fn run_classify_cycle(
     Ok(())
 }
 
+/// Copy the discovered topology into the BPF rodata consts (`cpu_num`,
+/// `cpu_kind_num`, `cpus_fast_to_slow`, `cpus_slow_to_fast`, `cpu_info`).
+/// Must run after `open()` and before `load()` so libbpf rewrites the values
+/// while the verifier still treats them as constants.
+fn pack_topology(open_skel: &mut OpenBpfSkel, topo: &topology::Topology) {
+    let rodata = open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .expect("BPF rodata section missing");
+
+    rodata.cpu_num = topo.cpu_num;
+    rodata.cpu_kind_num = topo.cpu_kind_num;
+
+    // The rodata arrays are fixed-size [.. ; MAX_CPU]; copy in the prefix we
+    // filled and leave the rest at its zero default.
+    for (dst, &src) in rodata.cpus_fast_to_slow.iter_mut().zip(&topo.cpus_fast_to_slow) {
+        *dst = src;
+    }
+    for (dst, &src) in rodata.cpus_slow_to_fast.iter_mut().zip(&topo.cpus_slow_to_fast) {
+        *dst = src;
+    }
+    for (dst, src) in rodata.cpu_info.iter_mut().zip(&topo.cpu_info) {
+        dst.cpu_kind = src.cpu_kind;
+        dst.freq_n = src.freq_n;
+        dst.freq_d = src.freq_d;
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -525,6 +555,12 @@ fn main() -> Result<()> {
 
     // Initialize SCX enums from kernel BTF (SCX_DSQ_LOCAL_ON, etc.)
     scx_utils::import_enums!(open_skel);
+
+    // Discover CPU topology (big/little kinds by max_freq) and pack it into the
+    // BPF rodata consts before load, so the verifier sees them as constants.
+    let topo = topology::Topology::discover();
+    log!(logger, "topology: {}", topo.summary());
+    pack_topology(&mut open_skel, &topo);
 
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
 
