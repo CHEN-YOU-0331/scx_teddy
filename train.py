@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 # Columns that are metadata, not features for training
-META_COLUMNS = {"tid", "tgid", "ppid", "comm"}
+META_COLUMNS = {"tid", "tgid", "ppid", "comm", "ancestor"}
 
 
 def get_feature_columns(df):
@@ -134,16 +134,6 @@ def train(csv_path, output_path, n_clusters=None):
                 member["command"] = row.get("comm", None)
             members.append(member)
         clusters[f"cluster_{c}"] = members
-
-    # Print
-    for c in range(n_clusters):
-        key = f"cluster_{c}"
-        print(f"\n--- {key} ---")
-        for m in clusters[key]:
-            if has_meta:
-                print(f"  tid={m['tid']}, tgid={m.get('tgid')}, ppid={m.get('ppid')}, cmd={m.get('command')}")
-            else:
-                print(f"  tid={m['tid']}")
 
     # Save classification result
     result_path = output_path.replace(".json", "_result.json")
