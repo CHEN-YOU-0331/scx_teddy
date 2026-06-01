@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Launch the Streamlit mockup dashboard.
+# Launch the Streamlit dashboard (Collect / Train / Static t-SNE / Classify /
+# Overall — all backed by the real scx_teddy + train.py).
 #
 # Run from anywhere; paths are resolved relative to this script. Streamlit
-# opens the browser to a local URL (default http://localhost:8501) and
-# auto-reloads when app.py changes — convenient while iterating on the
-# visuals before any real backend is wired in.
+# serves a local URL (default http://localhost:8501) and auto-reloads when
+# app.py changes — convenient while iterating.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

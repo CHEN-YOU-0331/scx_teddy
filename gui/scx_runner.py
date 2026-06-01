@@ -30,7 +30,7 @@ TRAIN_PY = REPO_ROOT / "train.py"
 
 # Built binary location (cargo workspace target). Allow override via env so a
 # release build or a custom path can be pointed at without code changes.
-DEFAULT_BIN = REPO_ROOT / "target" / "debug" / "scx_teddy"
+DEFAULT_BIN = REPO_ROOT / "target" / "release" / "scx_teddy"
 SCX_TEDDY_BIN = Path(os.environ.get("SCX_TEDDY_BIN", DEFAULT_BIN))
 
 # Default scratch location for collected data, per demo.md ("/tmp"). /tmp is
@@ -128,6 +128,33 @@ def build_collect_argv(
         argv += ["--max-runtime", str(max_runtime)]
     if checkpoint:
         argv += ["--csv-checkpoint"]
+    return argv
+
+
+def build_classify_argv(
+    model: Path,
+    config: Path,
+    duration: int | None = None,
+    use_sudo: bool = True,
+) -> list[str]:
+    """Build the argv for a `scx_teddy --mode classify` run.
+
+    classify loads a trained model + scheduling config and runs until SIGINT
+    (no max-runtime — that deadline is collect-only). Like collect it needs
+    root for BPF, so it is wrapped in `sudo -E`.
+
+    `duration` is `-c/--collect-duration`: in classify mode it is the predict
+    *period* — the main loop re-classifies every `duration` seconds. scx_teddy's
+    built-in default (600s) is far too slow to feel interactive, so the GUI
+    passes an explicit value (defaulting to 1s).
+    """
+    argv: list[str] = []
+    if use_sudo:
+        argv += ["sudo", "-E"]
+    argv += [str(SCX_TEDDY_BIN), "--mode", "classify",
+             "--model", str(model), "--config", str(config)]
+    if duration is not None:
+        argv += ["--collect-duration", str(duration)]
     return argv
 
 

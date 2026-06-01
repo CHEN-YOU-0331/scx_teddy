@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "_mock_stash"))
 from tabs import collect as page_collect  # noqa: E402
 from tabs import train as page_train  # noqa: E402
 from tabs import static_tsne as page_static_tsne  # noqa: E402
+from tabs import classify as page_classify  # noqa: E402
 from tabs import overall as page_overall  # noqa: E402
 
 
@@ -165,9 +166,9 @@ if MOCK_TABS_ENABLED:
         mock.tick()
         st.session_state.last_tick = now
 
-    (tab_collect, tab_train, tab_static,
+    (tab_collect, tab_train, tab_static, tab_classify,
      tab_overall, tab_per, tab_cluster) = st.tabs([
-        "📥 Collect", "🧠 Train", "🗺 Static t-SNE",
+        "📥 Collect", "🧠 Train", "🗺 Static t-SNE", "🎯 Classify",
         "📊 Overall", "🔬 Per-task (mock)", "✨ Cluster (mock)",
     ])
     with tab_per:
@@ -175,8 +176,9 @@ if MOCK_TABS_ENABLED:
     with tab_cluster:
         cluster_page.render(mock)
 else:
-    tab_collect, tab_train, tab_static, tab_overall = st.tabs([
-        "📥 Collect", "🧠 Train", "🗺 Static t-SNE", "📊 Overall",
+    (tab_collect, tab_train, tab_static,
+     tab_classify, tab_overall) = st.tabs([
+        "📥 Collect", "🧠 Train", "🗺 Static t-SNE", "🎯 Classify", "📊 Overall",
     ])
 
 with tab_collect:
@@ -185,6 +187,8 @@ with tab_train:
     page_train.render()
 with tab_static:
     page_static_tsne.render()
+with tab_classify:
+    page_classify.render()
 with tab_overall:
     page_overall.render()
 
@@ -199,7 +203,7 @@ with tab_overall:
 import time as _time  # noqa: E402
 
 def _any_proc_running() -> bool:
-    for key in ("collect_handle", "train_handle"):
+    for key in ("collect_handle", "train_handle", "classify_handle"):
         h = st.session_state.get(key)
         if h is not None and h.is_running():
             return True
