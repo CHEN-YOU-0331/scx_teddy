@@ -52,9 +52,22 @@ def render():
         "Highlight (field=ids, e.g. `tgid=1234,5678`)",
         placeholder="leave empty to colour by cluster")
 
-    if not st.button("▶ Plot t-SNE", type="primary"):
-        st.caption("Press the button — t-SNE is moderately CPU-bound on "
-                   "large CSVs, so we don't recompute on every keystroke.")
+    plot_clicked = st.button("▶ Plot t-SNE", type="primary")
+
+    # A button is True only on the rerun that clicked it. The Overall tab's
+    # 1 Hz st.rerun() fires reruns of the whole app, so if we gated the figure
+    # on `plot_clicked` it would vanish one second later. Instead the click
+    # *computes* and stashes the figure in session_state; the figure below is
+    # drawn from that stash on every rerun, so it persists until recomputed.
+    if not plot_clicked:
+        if "static_fig" in st.session_state:
+            fig, caption = st.session_state["static_fig"]
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": True})
+            st.caption(caption)
+        else:
+            st.caption("Press the button — t-SNE is moderately CPU-bound on "
+                       "large CSVs, so we don't recompute on every keystroke.")
         return
 
     if not csv_path or not Path(csv_path).exists():
@@ -145,6 +158,10 @@ def render():
         xaxis=dict(title="dim 1", showgrid=False, zeroline=False),
         yaxis=dict(title="dim 2", showgrid=False, zeroline=False),
     )
+    # Stash so the figure survives later reruns (e.g. the Overall tab's 1 Hz
+    # refresh) instead of being recomputed or blanked.
+    caption = f"{len(df)} tasks · {len(feature_cols)} features"
+    st.session_state["static_fig"] = (fig, caption)
     st.plotly_chart(fig, use_container_width=True,
                     config={"displayModeBar": True})
-    st.caption(f"{len(df)} tasks · {len(feature_cols)} features")
+    st.caption(caption)
