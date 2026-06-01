@@ -8,3 +8,12 @@ TODO.md
 slow_timer
 random_timer
 fix_mutex
+*.png
+test_ringbuf
+
+# perf / bpftrace measurement output (see tools/)
+offcpu_out/
+probe_out/
+tools
+__pycache__
+_mock_stash

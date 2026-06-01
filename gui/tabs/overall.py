@@ -1,0 +1,252 @@
+"""Overall tab — real-time system pulse from /proc.
+
+htop-like dashboard: total CPU/RAM, per-CPU strip, top-N task table.
+
+Data source is entirely `/proc` (via sys_metrics.Sampler) — scx_teddy is
+NOT involved in sampling. The table reserves columns for scx_teddy-side
+state (tier / slice / cluster) but fills them with '—' until a real export
+mechanism exists. We deliberately don't ask scx_teddy to publish per-second
+state just for the dashboard.
+
+Refresh model: the Streamlit script reruns every ~1 s (sleep+rerun loop in
+app.py); on each rerun this tab calls `sampler.sample()` once. Sampler is
+stateful (CPU% is a delta) and lives in `st.session_state`, so it survives
+reruns. Hist buffers are also session_state so the sparklines persist
+across tab switches even though no sample happens while we're elsewhere
+(short-pause is OK; multi-minute gaps will show a flat region — fine for
+demo).
+"""
+
+from __future__ import annotations
+
+from collections import deque
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+import sys_metrics
+import sys_topology
+
+
+# How many samples to keep in the rolling sparkline buffers. ~2 minutes at
+# 1 Hz; long enough to look like "history", short enough that the cost of
+# converting to a list each plot is invisible.
+HIST_LEN = 120
+
+# Colour palette for the small panels at top, kept consistent with the
+# stash mock so the look reads as one product. RGB strings (not hex) so the
+# sparkline helper can derive a low-alpha fill colour.
+CPU_LINE = "rgb(255,107,107)"
+RAM_LINE = "rgb(77,171,247)"
+
+
+def _ensure_state():
+    """Lazy-init the per-session sampler, topology, and history buffers."""
+    if "overall_sampler" not in st.session_state:
+        st.session_state.overall_sampler = sys_metrics.Sampler()
+        st.session_state.overall_groups = sys_topology.discover()
+        st.session_state.overall_cpu_hist = deque(maxlen=HIST_LEN)
+        st.session_state.overall_ram_hist = deque(maxlen=HIST_LEN)
+
+
+def _sparkline(values, colour: str, height: int = 70) -> go.Figure:
+    """Minimal area chart — no axes, no labels. The metric value above
+    carries the magnitude; the sparkline only shows the trend."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        y=list(values), mode="lines",
+        line=dict(color=colour, width=2),
+        fill="tozeroy",
+        fillcolor=colour.replace(")", ", 0.15)").replace("rgb", "rgba"),
+    ))
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False, range=[0, 100]),
+    )
+    return fig
+
+
+def _per_cpu_strip(per_cpu, groups: list[sys_topology.CoreGroup]) -> go.Figure:
+    """One bar per logical CPU, colour comes from the group it belongs to.
+    Works for any number of frequency tiers (1, 2, or future 3+)."""
+    n = len(per_cpu)
+    colours = []
+    for c in range(n):
+        g = sys_topology.group_of(c, groups)
+        colours.append(g.color if g else "#888")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=[f"CPU{c}" for c in range(n)],
+        y=list(per_cpu),
+        marker_color=colours,
+        hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_dark", height=180,
+        margin=dict(l=10, r=10, t=10, b=30), showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(range=[0, 100], title=None, ticksuffix="%"),
+        xaxis=dict(title=None, tickfont=dict(size=10)),
+    )
+    return fig
+
+
+def _group_legend_md(groups: list[sys_topology.CoreGroup]) -> str:
+    """Render a one-line markdown legend of the discovered groups, used
+    as the heading for the per-CPU strip. Looks like:
+    "P-core 0–11 @ 4.8 GHz · E-core 12–19 @ 3.5 GHz"."""
+    pieces = []
+    for g in groups:
+        cpu_range = (f"{g.cpus[0]}–{g.cpus[-1]}"
+                     if g.cpus[-1] - g.cpus[0] == len(g.cpus) - 1
+                     else ",".join(str(c) for c in g.cpus))
+        freq = f"{g.max_freq_ghz:.1f} GHz" if g.max_freq_khz > 0 else ""
+        label = f"<span style='color:{g.color}'>{g.name} {cpu_range}</span>"
+        if freq:
+            label += f" @ {freq}"
+        pieces.append(label)
+    return " · ".join(pieces)
+
+
+def render():
+    st.title("Overall · system pulse")
+
+    _ensure_state()
+    sampler: sys_metrics.Sampler = st.session_state.overall_sampler
+    groups: list[sys_topology.CoreGroup] = st.session_state.overall_groups
+    cpu_hist: deque = st.session_state.overall_cpu_hist
+    ram_hist: deque = st.session_state.overall_ram_hist
+
+    # Sample once per rerun. The first ever sample returns zeros (CPU% is a
+    # delta and there's no prior tick to subtract from); we still push it so
+    # the history grows immediately.
+    snap = sampler.sample()
+    cpu_hist.append(snap.cpu_total_pct)
+    ram_pct = (100 * snap.ram_used_mb / snap.ram_total_mb
+               if snap.ram_total_mb else 0)
+    ram_hist.append(ram_pct)
+
+    # ---- Top metrics row -------------------------------------------------
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total CPU", f"{snap.cpu_total_pct:.1f}%")
+        st.plotly_chart(_sparkline(cpu_hist, CPU_LINE),
+                        use_container_width=True,
+                        config={"displayModeBar": False})
+    with c2:
+        st.metric("RAM used",
+                  f"{snap.ram_used_mb/1024:.1f} / "
+                  f"{snap.ram_total_mb/1024:.0f} GB")
+        st.plotly_chart(_sparkline(ram_hist, RAM_LINE),
+                        use_container_width=True,
+                        config={"displayModeBar": False})
+    with c3:
+        st.metric("Active tasks", f"{len(snap.tasks)}")
+        st.caption(f"sampling /proc/<pid>/task/<tid>/stat · "
+                   f"Δt = {snap.wall_dt:.2f}s")
+    with c4:
+        # Show group composition rather than P/E counts (more honest on
+        # hybrid != Intel-style hardware). One line per group.
+        lines = []
+        for g in groups:
+            lines.append(f"<span style='color:{g.color}'>●</span> "
+                         f"{g.name}: {len(g.cpus)}")
+        st.markdown("**Core groups**<br>" + "<br>".join(lines),
+                    unsafe_allow_html=True)
+
+    st.divider()
+
+    # ---- Per-CPU strip ---------------------------------------------------
+    st.markdown(f"##### Per-CPU utilisation · {_group_legend_md(groups)}",
+                unsafe_allow_html=True)
+    st.plotly_chart(_per_cpu_strip(snap.per_cpu_pct, groups),
+                    use_container_width=True,
+                    config={"displayModeBar": False})
+
+    # ---- Filters ---------------------------------------------------------
+    # Three optional filters: comm substring (case-insensitive), tgid list,
+    # ppid list. All-empty = show everything. Kept in session_state so they
+    # survive the per-second rerun loop (otherwise the user can never
+    # finish typing).
+    st.markdown("##### Filter")
+    f1, f2, f3 = st.columns(3)
+    comm_q = f1.text_input(
+        "comm contains", value=st.session_state.get("ov_comm", ""),
+        placeholder="e.g. firefox", key="ov_comm",
+        help="Case-insensitive substring match against the task's comm.")
+    tgid_q = f2.text_input(
+        "tgid in", value=st.session_state.get("ov_tgid", ""),
+        placeholder="e.g. 1234, 5678", key="ov_tgid",
+        help="Comma-separated tgids; empty = any.")
+    ppid_q = f3.text_input(
+        "ppid in", value=st.session_state.get("ov_ppid", ""),
+        placeholder="e.g. 1, 4321", key="ov_ppid",
+        help="Comma-separated ppids; empty = any.")
+
+    def _parse_int_list(s: str) -> set[int]:
+        out: set[int] = set()
+        for piece in s.replace(" ", "").split(","):
+            if piece.isdigit():
+                out.add(int(piece))
+        return out
+
+    tgid_set = _parse_int_list(tgid_q)
+    ppid_set = _parse_int_list(ppid_q)
+    comm_needle = comm_q.strip().lower()
+
+    def _matches(t):
+        if comm_needle and comm_needle not in t.comm.lower():
+            return False
+        if tgid_set and t.tgid not in tgid_set:
+            return False
+        if ppid_set and t.ppid not in ppid_set:
+            return False
+        return True
+
+    filtered = [t for t in snap.tasks if _matches(t)] if (
+        comm_needle or tgid_set or ppid_set) else snap.tasks
+    filter_active = (comm_needle or tgid_set or ppid_set)
+
+    # ---- Task table ------------------------------------------------------
+    # Sort all tasks by CPU% descending and show them all. Streamlit's
+    # dataframe widget virtualises rows (only the visible window is rendered),
+    # so a few thousand rows is fine — render cost is roughly the same as
+    # 20 rows because the off-screen rows aren't drawn until the user scrolls.
+    # The scx_teddy-side fields are placeholder dashes — present so the
+    # column layout matches the eventual real version and reviewers can see
+    # "this is where tier/cluster will live".
+    top = sorted(filtered, key=lambda t: t.cpu_pct, reverse=True)
+    rows = [{
+        "tid": t.tid,
+        "tgid": t.tgid,
+        "comm": t.comm,
+        "ppid": t.ppid,
+        "CPU%": round(t.cpu_pct, 1),
+        "RAM(MB)": round(t.ram_mb, 1),
+        # Placeholder columns — see module docstring.
+        "tier": "—",
+        "slice(ms)": "—",
+        "cluster": "—",
+    } for t in top]
+    df = pd.DataFrame(rows)
+    if filter_active:
+        header = (f"##### {len(filtered)} matching tasks "
+                  f"of {len(snap.tasks)} · sorted by CPU%")
+    else:
+        header = f"##### {len(snap.tasks)} tasks · sorted by CPU%"
+    st.markdown(header +
+                "  <span style='color:#888;font-size:0.85rem'>"
+                "(tier / slice / cluster pending scx_teddy export)</span>",
+                unsafe_allow_html=True)
+    st.dataframe(
+        df, use_container_width=True, hide_index=True, height=560,
+        column_config={
+            "CPU%": st.column_config.ProgressColumn(
+                "CPU%", min_value=0, max_value=100, format="%.1f%%"),
+            "RAM(MB)": st.column_config.NumberColumn("RAM(MB)", format="%.0f"),
+        },
+    )

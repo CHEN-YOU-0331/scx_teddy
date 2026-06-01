@@ -12,6 +12,42 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+/* CPU topology, filled by userspace (topology.rs) into rodata before load. */
+const volatile u8 cpu_num;       // number of online logical CPUs in use
+const volatile u8 cpu_kind_num;  // number of distinct freq kinds (>= 1)
+/* CPUs sorted by speed. cpus_fast_to_slow[0] is the fastest CPU id;
+ * cpus_slow_to_fast is the reverse. Only the first `cpu_num` entries are set. */
+const volatile u8 cpus_fast_to_slow[MAX_CPU];
+const volatile u8 cpus_slow_to_fast[MAX_CPU];
+/* Indexed by logical CPU id. */
+const volatile cpu_info_t cpu_info[MAX_CPU];
+
+/* DSQ layout
+ * ----------
+ * Each priority owns a contiguous block of (1 + cpu_kind_num) DSQs starting at
+ * DSQ_BASE, in priority order (prio 0 first). Within a priority block the slot
+ * is the CPU kind:
+ *   slot 0          = the shared DSQ — any CPU kind may pull from it.
+ *   slot 1..kind_num = the kind-only DSQ for that CPU kind (kinds are 1-based,
+ *                      kind 1 = fastest; see topology.rs CpuInfo::cpu_kind).
+ * Total DSQ count is PRIORITY_NUM * (1 + cpu_kind_num).
+ *
+ * dispatch pulls slot 0 (shared, "runs anywhere") before the running CPU's own
+ * kind slot within a priority, and walks priorities 0 -> PRIORITY_NUM-1.
+ */
+
+/* Number of DSQs in one priority block. */
+static __always_inline u32 dsq_per_prio(void)
+{
+    return 1 + cpu_kind_num;
+}
+
+/* DSQ id for a priority and slot. slot 0 = shared, slot k = CPU kind k. */
+static __always_inline u64 dsq_id(s32 prio, u32 kind)
+{
+    return DSQ_BASE + (u64)prio * dsq_per_prio() + kind;
+}
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -98,8 +134,9 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
             return NULL;
         s32 key = p->pid;
         target_ctx->slice = DEFAULT_SLICE;
-        target_ctx->prio = TIER_BATCH;
+        target_ctx->prio = DEFAULT_PRIO;
         target_ctx->config = 1;
+        target_ctx->kind = 0; // default: shared DSQ (no kind restriction)
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
@@ -122,8 +159,13 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags)
 {
     target_ctx_t *target_ctx = get_target_storage(p);
-    if (!target_ctx || target_ctx->prio == TIER_BATCH) {
-        scx_bpf_dsq_insert(p, OTHER_DSQ, DEFAULT_SLICE, wake_flags);
+    if (!target_ctx) {
+        scx_bpf_dsq_insert(p, dsq_id(DEFAULT_PRIO, 0), DEFAULT_SLICE, wake_flags);
+        return prev_cpu;
+    }
+
+    if (target_ctx->prio >= CRITICAL_PRIO) {
+        scx_bpf_dsq_insert(p, dsq_id(DEFAULT_PRIO, target_ctx->kind), DEFAULT_SLICE, wake_flags);
         return prev_cpu;
     }
         
@@ -147,32 +189,35 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
 {
     target_ctx_t *target_ctx = get_target_storage(p);
-    if (!target_ctx || target_ctx->prio == TIER_BATCH) {
-        scx_bpf_dsq_insert(p, OTHER_DSQ, DEFAULT_SLICE, enq_flags);
-        return;
-    }
-    if ((enq_flags & SCX_ENQ_WAKEUP) && target_ctx->prio < TIER_NORMAL) {
-        scx_bpf_dsq_insert(p, CRITICAL_WAKEUP_DSQ + target_ctx->prio, target_ctx->slice, enq_flags);
+    if (!target_ctx) {
+        /* No ctx: fall back to the lowest-priority shared DSQ (batch). */
+        scx_bpf_dsq_insert(p, dsq_id(DEFAULT_PRIO, 0), DEFAULT_SLICE, enq_flags);
         return;
     }
 
-    scx_bpf_dsq_insert(p, CRITICAL_DSQ + target_ctx->prio, target_ctx->slice, enq_flags);
+    scx_bpf_dsq_insert(p, dsq_id(target_ctx->prio, target_ctx->kind),
+                       target_ctx->slice, enq_flags);
 }
 
 void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
 {
-    if (scx_bpf_dsq_move_to_local(CRITICAL_WAKEUP_DSQ))
+    /* cpu is the running CPU id, always in [0, cpu_num) — but the verifier
+     * treats the s32 arg as possibly negative, so cpu_info[cpu] would read
+     * out of bounds in its eyes. Clamp explicitly so the index is provably
+     * within [0, MAX_CPU). */
+    if (cpu < 0 || cpu >= MAX_CPU)
         return;
-    else if (scx_bpf_dsq_move_to_local(INTERACTIVE_WAKEUP_DSQ))
-        return;
-    else if (scx_bpf_dsq_move_to_local(CRITICAL_DSQ))
-        return;
-    else if (scx_bpf_dsq_move_to_local(INTERACTIVE_DSQ))
-        return;
-    else if (scx_bpf_dsq_move_to_local(NORMAL_DSQ))
-        return;
-    else if (scx_bpf_dsq_move_to_local(OTHER_DSQ))
-        return;
+    /* This CPU's kind selects which kind-only DSQ this CPU may pull from. */
+    u32 kind = cpu_info[cpu].cpu_kind;
+
+    /* Walk priorities high -> low. Within each priority, pull the shared
+     * (any-kind) DSQ before this CPU's own kind DSQ — "runs anywhere" wins. */
+    for (s32 prio = 0; prio < PRIORITY_NUM; prio++) {
+        if (scx_bpf_dsq_move_to_local(dsq_id(prio, 0)))
+            return;
+        if (scx_bpf_dsq_move_to_local(dsq_id(prio, kind)))
+            return;
+    }
 }
 
 void BPF_STRUCT_OPS(teddy_tick, struct task_struct *p)
@@ -182,8 +227,32 @@ void BPF_STRUCT_OPS(teddy_tick, struct task_struct *p)
 /* Initialize the scheduler */
 s32 BPF_STRUCT_OPS_SLEEPABLE(teddy_init)
 {
-    for (s32 i = 0;i < DSQ_NUM;i++) {
-        s32 ret = scx_bpf_create_dsq(CRITICAL_DSQ + i, -1);
+    /* Dump the topology rodata filled by userspace (topology.rs), visible via
+     * `cat /sys/kernel/debug/tracing/trace_pipe`. Loops are bounded by MAX_CPU
+     * (compile-time) for the verifier and broken early at cpu_num. */
+    bpf_printk("teddy topo: cpu_num=%u cpu_kind_num=%u", cpu_num, cpu_kind_num);
+    for (u32 i = 0; i < MAX_CPU; i++) {
+        if (i >= cpu_num)
+            break;
+        bpf_printk("teddy topo: cpu%u kind=%u freq=%u/%u",
+                   i, cpu_info[i].cpu_kind, cpu_info[i].freq_n, cpu_info[i].freq_d);
+    }
+    for (u32 i = 0; i < MAX_CPU; i++) {
+        if (i >= cpu_num)
+            break;
+        bpf_printk("teddy topo: order[%u] fast_to_slow=%u slow_to_fast=%u",
+                   i, cpus_fast_to_slow[i], cpus_slow_to_fast[i]);
+    }
+
+    /* Create the DSQs now that the topology is known: PRIORITY_NUM priority
+     * blocks of (1 + cpu_kind_num) DSQs each (slot 0 shared + one per kind).
+     * The loop is bounded by the compile-time max (PRIORITY_NUM * (1 +
+     * MAX_CPU_KIND)) for the verifier and broken early at the real count. */
+    u32 dsq_total = (u32)PRIORITY_NUM * dsq_per_prio();
+    for (u32 i = 0; i < PRIORITY_NUM * (1 + MAX_CPU_KIND); i++) {
+        if (i >= dsq_total)
+            break;
+        s32 ret = scx_bpf_create_dsq(DSQ_BASE + i, -1);
         if (ret < 0)
             return ret;
     }
@@ -235,8 +304,24 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
-    target_ctx->runtime_ns += now - target_ctx->start_running;
+    
+    u64 now_runtime = now - target_ctx->start_running;
+    /* Normalize CPU frequency differences between big and little cores 
+     * to avoid overestimating task load when tasks are executed on little 
+     * cores.*/
+    {
+        u32 cpu = bpf_get_smp_processor_id();
+        u64 freq_n = cpu_info[cpu].freq_n;
+        u64 freq_d = cpu_info[cpu].freq_d;
+        if (freq_n != freq_d) {
+            now_runtime *= freq_n;
+            now_runtime /= freq_d;
+        }
+    }
+
+    target_ctx->runtime_ns += now_runtime;
     target_ctx->in_iowait_cnt += BPF_CORE_READ_BITFIELD_PROBED(p, in_iowait);
+
     if (!runnable) {
         target_ctx->sleep_cnt++;
         if (target_ctx->sleep_start != 0) {
@@ -256,6 +341,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (unlikely(update_info)) {
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
+        target_ctx->kind = update_info->kind;
         bpf_map_delete_elem(&update_map, &key);
     }
 

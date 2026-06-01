@@ -1,0 +1,150 @@
+"""Static t-SNE tab — loads a collected CSV, runs t-SNE, plots with plotly.
+
+Optionally colours points by KMeans cluster from a model's `_result.json`,
+or splits them into a target (tgid / ppid / tid) vs the rest.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+import scx_runner as runner
+import theme
+
+
+def render():
+    st.title("Static t-SNE · plot a collected CSV")
+
+    csvs = runner.list_csvs()
+    csv_names = [str(p) for p in csvs]
+    # Default to the most recently produced CSV (may sit outside /tmp).
+    default_csv = (str(runner.last_csv) if runner.last_csv is not None
+                   else (csv_names[0] if csv_names else ""))
+    csv_path = st.selectbox(
+        "CSV",
+        options=csv_names if csv_names else [""],
+        index=csv_names.index(default_csv) if default_csv in csv_names else 0,
+        format_func=lambda s: s or "(no CSVs found)",
+        key="static_csv_pick")
+
+    # Optional cluster-result JSON. Default to the result file paired with
+    # the most-recently trained model, if present.
+    results = runner.list_files("model_*_result.json")
+    result_names = ["(none — single colour)"] + [str(p) for p in results]
+    default_result = ""
+    if runner.last_model is not None:
+        rp = runner.result_path_for(runner.last_model)
+        if rp.exists():
+            default_result = str(rp)
+    result_idx = 0
+    if default_result in result_names:
+        result_idx = result_names.index(default_result)
+    result_choice = st.selectbox(
+        "Cluster result JSON (optional)",
+        options=result_names, index=result_idx, key="static_result_pick")
+
+    hl_text = st.text_input(
+        "Highlight (field=ids, e.g. `tgid=1234,5678`)",
+        placeholder="leave empty to colour by cluster")
+
+    if not st.button("▶ Plot t-SNE", type="primary"):
+        st.caption("Press the button — t-SNE is moderately CPU-bound on "
+                   "large CSVs, so we don't recompute on every keystroke.")
+        return
+
+    if not csv_path or not Path(csv_path).exists():
+        st.error(f"CSV not found: {csv_path}")
+        return
+
+    # Lazy imports — sklearn is heavy, don't pay on every Streamlit reload.
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import StandardScaler
+
+    with st.spinner("Loading & running t-SNE…"):
+        df = pd.read_csv(csv_path)
+        meta = {"tid", "tgid", "ppid", "ancestor", "comm"}
+        feature_cols = [c for c in df.columns if c not in meta]
+        if not feature_cols:
+            st.error("CSV has no feature columns.")
+            return
+        if len(df) < 3:
+            st.error(f"Need ≥3 tasks for t-SNE (have {len(df)}).")
+            return
+        X = StandardScaler().fit_transform(df[feature_cols].values)
+        n = X.shape[0]
+        perplexity = max(2.0, min(30.0, (n - 1) / 3.0))
+        coords = TSNE(n_components=2, perplexity=perplexity,
+                      init="pca", random_state=42).fit_transform(X)
+        df["x"] = coords[:, 0]
+        df["y"] = coords[:, 1]
+
+    # Decide colouring scheme. Highlight takes precedence over cluster.
+    hl_field, hl_ids = "", None
+    if hl_text.strip() and "=" in hl_text:
+        f, ids = hl_text.split("=", 1)
+        hl_field = f.strip()
+        try:
+            hl_ids = {int(x) for x in ids.split(",") if x.strip()}
+        except ValueError:
+            hl_ids = set()
+
+    fig = go.Figure()
+    if hl_ids is not None and hl_field in df.columns:
+        tgt = df[df[hl_field].isin(hl_ids)]
+        oth = df[~df[hl_field].isin(hl_ids)]
+        fig.add_trace(go.Scatter(
+            x=oth["x"], y=oth["y"], mode="markers", name="other",
+            marker=dict(size=6, color="#555", opacity=0.5),
+            hovertext=oth.get("comm", oth["tid"]),
+            hovertemplate="%{hovertext}<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            x=tgt["x"], y=tgt["y"], mode="markers", name="target",
+            marker=dict(size=11, color="#ff5252",
+                        line=dict(color="white", width=1)),
+            hovertext=tgt.get("comm", tgt["tid"]),
+            hovertemplate="%{hovertext}<extra></extra>"))
+        title = f"target {hl_field} ∈ {sorted(hl_ids)}"
+    elif result_choice != result_names[0] and Path(result_choice).exists():
+        with open(result_choice) as f:
+            clusters = json.load(f)
+        tid_to_cluster: dict[int, int] = {}
+        for k, members in clusters.items():
+            idx = int(k.rsplit("_", 1)[-1])
+            for m in members:
+                tid_to_cluster[int(m["tid"])] = idx
+        labels = df["tid"].map(tid_to_cluster).fillna(-1).astype(int)
+        for c in sorted(labels.unique()):
+            mask = labels == c
+            name = "unlabelled" if c == -1 else f"cluster {c}"
+            colour = "#666" if c == -1 else theme.cluster_color(c)
+            fig.add_trace(go.Scatter(
+                x=df.loc[mask, "x"], y=df.loc[mask, "y"],
+                mode="markers", name=name,
+                marker=dict(size=7, color=colour, opacity=0.85),
+                hovertext=df.loc[mask].get("comm", df.loc[mask, "tid"]),
+                hovertemplate="%{hovertext}<extra></extra>"))
+        title = "coloured by KMeans cluster"
+    else:
+        fig.add_trace(go.Scatter(
+            x=df["x"], y=df["y"], mode="markers", name="tasks",
+            marker=dict(size=7, color="#1f77b4", opacity=0.85),
+            hovertext=df.get("comm", df["tid"]),
+            hovertemplate="%{hovertext}<extra></extra>"))
+        title = "all tasks"
+
+    fig.update_layout(
+        template="plotly_dark", height=620,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=dict(text=f"t-SNE · {title}", x=0.5),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(title="dim 1", showgrid=False, zeroline=False),
+        yaxis=dict(title="dim 2", showgrid=False, zeroline=False),
+    )
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": True})
+    st.caption(f"{len(df)} tasks · {len(feature_cols)} features")

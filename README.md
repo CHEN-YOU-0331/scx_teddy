@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-scx_teddy operates in three modes: **collect** (gather task data), **classify** (apply a trained model to schedule tasks), and **debug_classify** (inspect cluster assignments without affecting scheduling).
+scx_teddy operates in two modes: **collect** (gather task data) and **classify** (apply a trained model to schedule tasks).
 
 ### Step 1: Collect Task Data
 
@@ -39,6 +39,8 @@ sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 - `-c, --collect-duration <SECONDS>` - Data collection interval in seconds (default: 600)
 - `-o, --output <PATH>` - Output CSV file path (default: `event.csv`)
 - `--min-events <N>` - Minimum event count to include a task (default: 3)
+- `--csv-checkpoint` - Write the CSV every collect cycle. By default the CSV is kept in memory and written only once on shutdown; enable this to checkpoint each cycle so a crash or `kill -9` does not lose the run's data.
+- `--max-runtime <SECONDS>` - Maximum total run time. Once reached, the in-memory CSV is written out and the scheduler exits. `0` means no limit (default: `0`).
 - `-v, --verbose` - Enable verbose output
 
 ### Step 2: Train a K-means Model
@@ -117,44 +119,6 @@ sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config co
 **Additional options for classify mode:**
 - `--model <PATH>` - Path to trained model JSON (required)
 - `--config <PATH>` - Path to scheduling config JSON (required)
-- `-c, --collect-duration <SECONDS>` - Refresh interval in seconds (default: 600)
-
-### Step 5: Debug Classification (Optional)
-
-`debug_classify` mode uses the same trained model but does **not** modify time slices or priorities. Instead, it periodically clears the terminal and prints which cluster each watched task was assigned to.
-
-```bash
-sudo ./target/release/scx_teddy -m debug_classify -c 10 \
-  --model model.json --debug-config debug.config
-```
-
-Create a `debug.config` file listing the `comm` names to watch, one per line (prefix matching, `#` for comments):
-
-```
-# custom workloads
-fixed-mutex
-slow-timer
-random-timer
-
-# stress-ng workers (prefix match)
-stress-ng-cpu
-stress-ng-hdd
-stress-ng-timer
-stress-ng-switc
-```
-
-Output format (refreshed every `--collect-duration` seconds):
-
-```
-[debug_classify]
-  fixed-mutex: [cluster3: 12]
-  stress-ng-cpu: [cluster0: 11, cluster2: 1]
-  stress-ng-timer: [cluster5: 12]
-```
-
-**Additional options for debug_classify mode:**
-- `--model <PATH>` - Path to trained model JSON (required)
-- `--debug-config <PATH>` - Path to debug config file (required)
 - `-c, --collect-duration <SECONDS>` - Refresh interval in seconds (default: 600)
 
 ---
