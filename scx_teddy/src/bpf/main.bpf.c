@@ -2,6 +2,7 @@
 /* scx_teddy - A BPF scheduler based on task runtime characteristics */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
@@ -319,7 +320,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     }
 
     target_ctx->runtime_ns += now_runtime;
-    target_ctx->in_iowait_cnt += p->in_iowait;
+    target_ctx->in_iowait_cnt += BPF_CORE_READ_BITFIELD_PROBED(p, in_iowait);
 
     if (!runnable) {
         target_ctx->sleep_cnt++;
