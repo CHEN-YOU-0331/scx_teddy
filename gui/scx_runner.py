@@ -174,6 +174,97 @@ def build_train_argv(
     return argv
 
 
+def model_n_clusters(model: Path) -> int | None:
+    """Read `n_clusters` out of a trained model JSON, or None if unreadable.
+
+    The Classify config editor uses this to show exactly one row per cluster
+    (cluster ids 0..n-1) plus the `default` row. Best-effort: a malformed or
+    missing file just yields None and the caller falls back to a manual count.
+    """
+    try:
+        import json
+        with open(model) as f:
+            n = json.load(f).get("n_clusters")
+        return int(n) if n is not None else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+# Defaults for a freshly-built cluster scheduling entry (see ClusterSchedConfig
+# in main.rs). prio 11 = lowest priority, a 100us fixed slice, cpu_kind 0 =
+# shared DSQ (runnable on any CPU kind). The editor seeds every row with these.
+CONFIG_DEFAULT_PRIO = 11
+CONFIG_DEFAULT_SLICE_NS = 100_000
+CONFIG_DEFAULT_CPU_KIND = 0
+
+
+def make_cluster_entry(prio: int = CONFIG_DEFAULT_PRIO,
+                       slice_ns: int = CONFIG_DEFAULT_SLICE_NS,
+                       cpu_kind: int = CONFIG_DEFAULT_CPU_KIND) -> dict:
+    """One cluster's scheduling entry in the fixed-slice shape scx_teddy reads:
+    {"prio", "slice_mode":"fixed", "slice_ns", "cpu_kind"}.
+
+    slice_ns is floored at CONFIG_DEFAULT_SLICE_NS (100us): anything smaller is
+    not what the scheduler actually grants in practice, so a smaller value would
+    silently mislead. We clamp at the single point every saved config flows
+    through rather than only in the editor widget."""
+    return {"prio": int(prio), "slice_mode": "fixed",
+            "slice_ns": max(int(slice_ns), CONFIG_DEFAULT_SLICE_NS),
+            "cpu_kind": int(cpu_kind)}
+
+
+def read_config(path: Path) -> tuple[dict, dict] | None:
+    """Parse an existing scheduling config JSON into ({clusters}, default).
+
+    Best-effort: returns None if the file is missing or malformed. Used by the
+    Classify editor's "Existing file" mode to seed the table from a config on
+    disk, which the user can then re-shape (clusters added/dropped) before it
+    is re-serialized to /tmp.
+    """
+    try:
+        import json
+        with open(path) as f:
+            obj = json.load(f)
+        clusters = obj.get("clusters", {})
+        default = obj.get("default", {})
+        if not isinstance(clusters, dict) or not isinstance(default, dict):
+            return None
+        return clusters, default
+    except (OSError, ValueError):
+        return None
+
+
+def _config_json(clusters: dict[str, dict], default: dict) -> str:
+    import json
+    return json.dumps({"clusters": clusters, "default": default}, indent=2)
+
+
+def write_config(clusters: dict[str, dict], default: dict,
+                 directory: Path | None = None) -> Path:
+    """Serialize a {clusters, default} scheduling config to a fresh timestamped
+    JSON under the data dir (tmpfs by default) and return its path.
+
+    Writing to /tmp keeps the GUI-built config out of the repo and means the
+    "edit in the GUI" path is just "write a file, then `--config` it" — no new
+    channel, same thin-shell model as everything else here.
+    """
+    out = timestamped_path("config", "json", directory=directory)
+    out.write_text(_config_json(clusters, default))
+    return out
+
+
+def save_config_to(path: Path, clusters: dict[str, dict], default: dict) -> Path:
+    """Write a {clusters, default} config to an explicit path, overwriting it.
+
+    This is the deliberate "save back to the original file" action (the Classify
+    editor's Save button) — distinct from `write_config`, which always picks a
+    fresh /tmp path. Kept separate so an overwrite only ever happens on an
+    explicit user click, never as a side effect of starting a run.
+    """
+    path.write_text(_config_json(clusters, default))
+    return path
+
+
 def ensure_data_dir() -> Path:
     DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
     return DEFAULT_DATA_DIR
