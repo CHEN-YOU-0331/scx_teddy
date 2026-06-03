@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use plain::Plain;
 
 use libbpf_rs::skel::OpenSkel;
@@ -390,6 +390,44 @@ fn climb_to_root(
     ts.ancestor = 1;
 }
 
+/// Where the per-cycle classify snapshot is written for the GUI's Overall tab
+/// to read. Fixed path under tmpfs; the dir is created lazily on first write.
+/// This is purely a GUI feed — scx_teddy works identically with no reader.
+const SNAPSHOT_DIR: &str = "/tmp/scx_teddy";
+const SNAPSHOT_PATH: &str = "/tmp/scx_teddy/snapshot.json";
+
+/// One task's scheduling state at the end of a classify cycle. Only the fields
+/// the GUI can't get from /proc itself — it already reads comm/tgid/ppid live
+/// and joins these in by `tid`, so we deliberately do NOT re-read /proc here
+/// (no extra IO on the cycle, no duplication with the GUI's own sampling).
+#[derive(Serialize)]
+struct TaskSnapshot {
+    tid: i32,
+    cluster: usize,
+    prio: i32,
+    slice_ns: u64,
+    cpu_kind: u8,
+}
+
+/// Atomically publish the cycle's snapshot: write a sibling `.tmp` then rename
+/// over the real path. rename(2) within a directory is atomic, so the GUI
+/// (which may read at any moment) only ever sees a complete file — never a
+/// half-written one. Best-effort: any IO error is logged and swallowed so a
+/// missing /tmp or a full disk can never disturb the scheduler.
+fn write_snapshot(tasks: &[TaskSnapshot], logger: &Rc<RefCell<Logger>>) {
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(SNAPSHOT_DIR)?;
+        let tmp = format!("{SNAPSHOT_PATH}.tmp");
+        let json = serde_json::to_vec(tasks)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, SNAPSHOT_PATH)
+    };
+    if let Err(e) = write() {
+        log!(logger, "  [snapshot] write to {} failed: {}", SNAPSHOT_PATH, e);
+    }
+}
+
 /// Run one classify cycle: predict each eligible task's cluster and write the
 /// resulting {prio, slice} into `update_map`. Only tasks with new data since
 /// the last cycle are processed (`take_features_if_needed`).
@@ -417,6 +455,10 @@ fn run_classify_cycle(
 ) -> Result<()> {
     let n = classifier.n_clusters();
     let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
+    // GUI Overall feed: one entry per task predicted this cycle (i.e. that
+    // woke at least once since last cycle). Tasks that stayed asleep aren't
+    // here — the GUI leaves their tier/slice/cluster columns blank.
+    let mut snapshot: Vec<TaskSnapshot> = Vec::new();
 
     let wall_start = Instant::now();
     let cpu_start = thread_cpu_time();
@@ -449,6 +491,10 @@ fn run_classify_cycle(
         let prio = cluster_cfg.prio;
         let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
 
+        snapshot.push(TaskSnapshot {
+            tid, cluster, prio, slice_ns, cpu_kind: cluster_cfg.cpu_kind,
+        });
+
         // Write sched_info_t {prio: s32, kind: u8, slice: u64} to update_map.
         // C layout (8-byte aligned): prio[0..4] | kind[4] | pad[5..8] | slice[8..16]
         let tid_key = tid.to_ne_bytes();
@@ -458,6 +504,10 @@ fn run_classify_cycle(
         val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
         update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
     }
+
+    // Publish the snapshot for the GUI. Done before the timing log so the
+    // file reflects this cycle as promptly as possible.
+    write_snapshot(&snapshot, logger);
 
     let batch_wall_us = wall_start.elapsed().as_micros();
     let batch_cpu_us  = (thread_cpu_time() - cpu_start).as_micros();
