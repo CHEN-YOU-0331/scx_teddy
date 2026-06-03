@@ -341,7 +341,11 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (unlikely(update_info)) {
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
-        target_ctx->kind = update_info->kind;
+
+        /* Only apply the cpu_kind setting when the task is not bound
+         * to a specific CPU. */
+        if (BPF_CORE_READ(p, nr_cpus_allowed) == (s32)cpu_num) 
+            target_ctx->kind = update_info->kind;
         bpf_map_delete_elem(&update_map, &key);
     }
 
