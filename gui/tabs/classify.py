@@ -33,29 +33,57 @@ def _model_choices() -> list[str]:
     return models
 
 
-def _row_from_entry(cluster: str, entry: dict | None) -> dict:
+def _cpu_kind_label(k: int, groups: list) -> str:
+    """A cpu_kind value rendered as `"<int> · <meaning>"`. 0 = any CPU; 1-based
+    into the fast→slow groups, so kind k names groups[k-1] (P-core / E-core /
+    tier-N). The int is the leading token, which makes the label trivially
+    reversible (see _cpu_kind_int) without threading the group list everywhere."""
+    if k == 0:
+        return "0 · any"
+    if 1 <= k <= len(groups):
+        return f"{k} · {groups[k - 1].name}"
+    return f"{k} · kind {k}"
+
+
+def _cpu_kind_int(label: str) -> int:
+    """Inverse of _cpu_kind_label: the int is the leading token before ` · `."""
+    try:
+        return int(str(label).split("·", 1)[0].strip())
+    except (ValueError, IndexError):
+        return runner.CONFIG_DEFAULT_CPU_KIND
+
+
+def _cpu_kind_options(groups: list) -> list[str]:
+    """All valid cpu_kind labels for this machine: 0 (any) plus one per kind."""
+    return [_cpu_kind_label(k, groups) for k in range(len(groups) + 1)]
+
+
+def _row_from_entry(cluster: str, entry: dict | None, groups: list) -> dict:
     """One editor row. `entry` is a cluster's config dict (from a loaded file)
     or None to fall back to the GUI defaults. Only the fields the editor shows
     are pulled out; slice_mode/extra keys are dropped (the editor is fixed-slice
-    only, so re-serializing always writes a clean fixed entry)."""
+    only, so re-serializing always writes a clean fixed entry).
+
+    cpu_kind and cpu_prefer are held as labelled strings (so the table shows
+    dropdowns) and mapped back to ints on save."""
     entry = entry or {}
     prefer_int = entry.get("cpu_prefer", runner.CONFIG_DEFAULT_CPU_PREFER)
+    kind_int = entry.get("cpu_kind", runner.CONFIG_DEFAULT_CPU_KIND)
     return {
         "cluster": cluster,
         "prio": entry.get("prio", runner.CONFIG_DEFAULT_PRIO),
         "slice_ns": entry.get("slice_ns", runner.CONFIG_DEFAULT_SLICE_NS),
-        "cpu_kind": entry.get("cpu_kind", runner.CONFIG_DEFAULT_CPU_KIND),
-        # Shown as a labelled dropdown; stored as the label string and mapped
-        # back to the 0/1/2 int on save. Unknown ints fall back to "no pref".
+        "cpu_kind": _cpu_kind_label(int(kind_int), groups),
         "cpu_prefer": runner.CPU_PREFER_LABELS.get(
             int(prefer_int), runner.CPU_PREFER_LABELS[0]),
     }
 
 
-def _seed_editor_df(n_clusters: int,
+def _seed_editor_df(n_clusters: int, groups: list,
                     loaded: tuple[dict, dict] | None = None) -> pd.DataFrame:
     """One row per cluster id (0..n-1) plus a final `default` row. The column
-    set is the row label + the three editable knobs.
+    set is the row label + the editable knobs. `groups` is the discovered CPU
+    topology, used to label the cpu_kind dropdown.
 
     `loaded` = (clusters, default) parsed from an existing config file. The
     table is always sized to `n_clusters` (the model's cluster count): a loaded
@@ -63,9 +91,9 @@ def _seed_editor_df(n_clusters: int,
     `loaded=None` seeds every row with the GUI defaults (the "Edit in GUI"
     fresh-start case)."""
     loaded_clusters, loaded_default = (loaded if loaded is not None else ({}, {}))
-    rows = [_row_from_entry(str(i), loaded_clusters.get(str(i)))
+    rows = [_row_from_entry(str(i), loaded_clusters.get(str(i)), groups)
             for i in range(n_clusters)]
-    rows.append(_row_from_entry("default", loaded_default))
+    rows.append(_row_from_entry("default", loaded_default, groups))
     return pd.DataFrame(rows)
 
 
@@ -76,11 +104,12 @@ def _df_to_config(df: pd.DataFrame) -> tuple[dict, dict]:
     clusters: dict[str, dict] = {}
     default = runner.make_cluster_entry()
     for _, r in df.iterrows():
-        # cpu_prefer is held as a label in the table; map it back to 0/1/2.
+        # cpu_kind and cpu_prefer are held as labels in the table; map back.
         prefer = runner.CPU_PREFER_BY_LABEL.get(
             str(r["cpu_prefer"]), runner.CONFIG_DEFAULT_CPU_PREFER)
         entry = runner.make_cluster_entry(
-            prio=r["prio"], slice_ns=r["slice_ns"], cpu_kind=r["cpu_kind"],
+            prio=r["prio"], slice_ns=r["slice_ns"],
+            cpu_kind=_cpu_kind_int(r["cpu_kind"]),
             cpu_prefer=prefer)
         if str(r["cluster"]).strip().lower() == "default":
             default = entry
@@ -166,17 +195,18 @@ def render():
             cap += " Loaded values shown; missing clusters use defaults."
         st.caption(cap)
 
+        # CPU topology drives the cpu_kind dropdown labels (0 = any, then one
+        # entry per kind named P-core / E-core / tier-N). Independent of
+        # scx_teddy — same self-contained topology the Overall tab uses.
+        groups = sys_topology.discover()
+
         # Reseed only when the source signature changes (mode + file + n);
         # otherwise keep the user's in-table edits across reruns.
         sig = (config_mode, src_path, n)
         if st.session_state.get("classify_cfg_sig") != sig:
-            st.session_state["classify_cfg_df"] = _seed_editor_df(n, loaded)
+            st.session_state["classify_cfg_df"] = _seed_editor_df(n, groups, loaded)
             st.session_state["classify_cfg_sig"] = sig
 
-        # cpu_kind upper bound = number of CPU kinds discovered from this
-        # machine's cpufreq tiers (1-based; 0 stays "any"). Independent of
-        # scx_teddy — same self-contained topology the Overall tab uses.
-        n_kinds = len(sys_topology.discover())
         edited_df = st.data_editor(
             st.session_state["classify_cfg_df"],
             key="classify_cfg_editor", hide_index=True,
@@ -191,11 +221,10 @@ def render():
                     "slice_ns", help="Fixed time slice in ns (floored at "
                     "100000 — the real minimum the scheduler grants).",
                     min_value=runner.CONFIG_DEFAULT_SLICE_NS, step=1000),
-                "cpu_kind": st.column_config.NumberColumn(
-                    "cpu_kind", help=f"0 = any CPU (shared DSQ); 1..{n_kinds} "
-                    f"pins to a CPU kind (1 = fastest). This machine has "
-                    f"{n_kinds} kind(s).", min_value=0, max_value=n_kinds,
-                    step=1),
+                "cpu_kind": st.column_config.SelectboxColumn(
+                    "cpu_kind", help="Which CPU kind to pin to. '0 · any' = "
+                    "shared DSQ (any CPU); otherwise 1-based, 1 = fastest tier.",
+                    options=_cpu_kind_options(groups), required=True),
                 "cpu_prefer": st.column_config.SelectboxColumn(
                     "cpu_prefer", help="select_cpu speed preference. "
                     "'no preference' lets the scheduler auto-derive it from "
