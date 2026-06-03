@@ -39,11 +39,16 @@ def _row_from_entry(cluster: str, entry: dict | None) -> dict:
     are pulled out; slice_mode/extra keys are dropped (the editor is fixed-slice
     only, so re-serializing always writes a clean fixed entry)."""
     entry = entry or {}
+    prefer_int = entry.get("cpu_prefer", runner.CONFIG_DEFAULT_CPU_PREFER)
     return {
         "cluster": cluster,
         "prio": entry.get("prio", runner.CONFIG_DEFAULT_PRIO),
         "slice_ns": entry.get("slice_ns", runner.CONFIG_DEFAULT_SLICE_NS),
         "cpu_kind": entry.get("cpu_kind", runner.CONFIG_DEFAULT_CPU_KIND),
+        # Shown as a labelled dropdown; stored as the label string and mapped
+        # back to the 0/1/2 int on save. Unknown ints fall back to "no pref".
+        "cpu_prefer": runner.CPU_PREFER_LABELS.get(
+            int(prefer_int), runner.CPU_PREFER_LABELS[0]),
     }
 
 
@@ -71,8 +76,12 @@ def _df_to_config(df: pd.DataFrame) -> tuple[dict, dict]:
     clusters: dict[str, dict] = {}
     default = runner.make_cluster_entry()
     for _, r in df.iterrows():
+        # cpu_prefer is held as a label in the table; map it back to 0/1/2.
+        prefer = runner.CPU_PREFER_BY_LABEL.get(
+            str(r["cpu_prefer"]), runner.CONFIG_DEFAULT_CPU_PREFER)
         entry = runner.make_cluster_entry(
-            prio=r["prio"], slice_ns=r["slice_ns"], cpu_kind=r["cpu_kind"])
+            prio=r["prio"], slice_ns=r["slice_ns"], cpu_kind=r["cpu_kind"],
+            cpu_prefer=prefer)
         if str(r["cluster"]).strip().lower() == "default":
             default = entry
         else:
@@ -171,7 +180,7 @@ def render():
         edited_df = st.data_editor(
             st.session_state["classify_cfg_df"],
             key="classify_cfg_editor", hide_index=True,
-            use_container_width=True, disabled=["cluster"],
+            width="stretch", disabled=["cluster"],
             column_config={
                 "cluster": st.column_config.TextColumn(
                     "cluster", help="Cluster id from the model, or `default`."),
@@ -187,6 +196,12 @@ def render():
                     f"pins to a CPU kind (1 = fastest). This machine has "
                     f"{n_kinds} kind(s).", min_value=0, max_value=n_kinds,
                     step=1),
+                "cpu_prefer": st.column_config.SelectboxColumn(
+                    "cpu_prefer", help="select_cpu speed preference. "
+                    "'no preference' lets the scheduler auto-derive it from "
+                    "cpu_kind; 'prefer fast' / 'prefer slow' force it.",
+                    options=list(runner.CPU_PREFER_LABELS.values()),
+                    required=True),
             })
         st.session_state["classify_cfg_df"] = edited_df
 

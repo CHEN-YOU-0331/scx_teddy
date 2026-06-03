@@ -196,13 +196,21 @@ def model_n_clusters(model: Path) -> int | None:
 CONFIG_DEFAULT_PRIO = 11
 CONFIG_DEFAULT_SLICE_NS = 100_000
 CONFIG_DEFAULT_CPU_KIND = 0
+CONFIG_DEFAULT_CPU_PREFER = 0
+
+# cpu_prefer encodes a select_cpu speed preference; the editor shows the labels
+# and writes the int. 0 = no preference (let the BPF side auto-derive from
+# cpu_kind), 1 = prefer the fastest CPUs, 2 = prefer the slowest.
+CPU_PREFER_LABELS = {0: "no preference", 1: "prefer fast", 2: "prefer slow"}
+CPU_PREFER_BY_LABEL = {v: k for k, v in CPU_PREFER_LABELS.items()}
 
 
 def make_cluster_entry(prio: int = CONFIG_DEFAULT_PRIO,
                        slice_ns: int = CONFIG_DEFAULT_SLICE_NS,
-                       cpu_kind: int = CONFIG_DEFAULT_CPU_KIND) -> dict:
+                       cpu_kind: int = CONFIG_DEFAULT_CPU_KIND,
+                       cpu_prefer: int = CONFIG_DEFAULT_CPU_PREFER) -> dict:
     """One cluster's scheduling entry in the fixed-slice shape scx_teddy reads:
-    {"prio", "slice_mode":"fixed", "slice_ns", "cpu_kind"}.
+    {"prio", "slice_mode":"fixed", "slice_ns", "cpu_kind", "cpu_prefer"}.
 
     slice_ns is floored at CONFIG_DEFAULT_SLICE_NS (100us): anything smaller is
     not what the scheduler actually grants in practice, so a smaller value would
@@ -210,7 +218,8 @@ def make_cluster_entry(prio: int = CONFIG_DEFAULT_PRIO,
     through rather than only in the editor widget."""
     return {"prio": int(prio), "slice_mode": "fixed",
             "slice_ns": max(int(slice_ns), CONFIG_DEFAULT_SLICE_NS),
-            "cpu_kind": int(cpu_kind)}
+            "cpu_kind": int(cpu_kind),
+            "cpu_prefer": int(cpu_prefer)}
 
 
 # Where classify mode publishes its per-cycle snapshot (see write_snapshot in
