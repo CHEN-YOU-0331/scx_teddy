@@ -22,6 +22,13 @@ const volatile u8 cpus_slow_to_fast[MAX_CPU];
 /* Indexed by logical CPU id. */
 const volatile cpu_info_t cpu_info[MAX_CPU];
 
+/* Fastest / slowest CPU kind. Kinds are 1-based with kind 1 = fastest (see
+ * topology.rs CpuInfo::cpu_kind), so the fastest kind is always 1 and the
+ * slowest is the highest kind id, cpu_kind_num. Used to honour CPU_FAST_PREFER
+ * / CPU_SLOW_PREFER in select_cpu. */
+#define FASTEST_KIND 1
+#define SLOWEST_KIND cpu_kind_num
+
 /* DSQ layout
  * ----------
  * Each priority owns a contiguous block of (1 + cpu_kind_num) DSQs starting at
@@ -145,14 +152,47 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
     return target_ctx;
 }
 
-static __always_inline s32 dispatch_sync_cold(struct task_struct *p, target_ctx_t *target_ctx, u64 wake_flags)
+/* Does a CPU satisfy this task's kind restriction? kind 0 = no restriction. */
+static __always_inline bool cpu_kind_ok(s32 cpu, target_ctx_t *target_ctx)
 {
-    u32 cpu = bpf_get_smp_processor_id();
-    if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-        return -1;
+    return target_ctx->kind == 0 || cpu_info[cpu].cpu_kind == target_ctx->kind;
+}
 
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, target_ctx->slice, wake_flags);
-    return (s32)cpu;
+/* Does a CPU satisfy this task's fast/slow preference? */
+static __always_inline bool cpu_prefer_ok(s32 cpu, target_ctx_t *target_ctx)
+{
+    switch (target_ctx->cpu_prefer) {
+    case CPU_FAST_PREFER:
+        return cpu_info[cpu].cpu_kind == FASTEST_KIND;
+    case CPU_SLOW_PREFER:
+        return cpu_info[cpu].cpu_kind == SLOWEST_KIND;
+    default: // CPU_NO_PREFER
+        return true;
+    }
+}
+
+/* Walk CPUs in the given speed order and claim the first idle one that
+ * satisfies the task's affinity and kind. Returns the claimed CPU (already
+ * marked non-idle via test_and_clear) or -1 if none. `order` is one of
+ * cpus_fast_to_slow / cpus_slow_to_fast. */
+static __always_inline s32 pick_idle_in_order(struct task_struct *p,
+                                              target_ctx_t *target_ctx,
+                                              const volatile u8 *order)
+{
+    for (u32 i = 0; i < MAX_CPU; i++) {
+        if (i >= cpu_num)
+            break;
+        s32 cpu = order[i];
+        if (!cpu_kind_ok(cpu, target_ctx))
+            continue;
+        if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+            continue;
+        /* test_and_clear atomically claims the idle CPU: once it returns true
+         * we own it and must dispatch to it. */
+        if (scx_bpf_test_and_clear_cpu_idle(cpu))
+            return cpu;
+    }
+    return -1;
 }
 
 s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -168,17 +208,33 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
         scx_bpf_dsq_insert(p, dsq_id(DEFAULT_PRIO, target_ctx->kind), DEFAULT_SLICE, wake_flags);
         return prev_cpu;
     }
-        
-    // p is woken by this cpu
-    if (wake_flags & SCX_WAKE_SYNC) {
-        s32 sync_cpu = dispatch_sync_cold(p, target_ctx, wake_flags);
-        if (sync_cpu >= 0)
-            return sync_cpu;
-    }
-    bool is_idle;
-    s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 
-    if (is_idle) {
+    if (wake_flags & SCX_WAKE_SYNC) {
+        s32 sync_cpu = bpf_get_smp_processor_id();
+        if (bpf_cpumask_test_cpu(sync_cpu, p->cpus_ptr) &&
+            cpu_kind_ok(sync_cpu, target_ctx) &&
+            cpu_prefer_ok(sync_cpu, target_ctx) &&
+            scx_bpf_test_and_clear_cpu_idle(sync_cpu)) {
+            scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)sync_cpu, target_ctx->slice, wake_flags);
+            return sync_cpu;
+        }
+    }
+
+    s32 cpu = -1;
+
+    /* No fast/slow preference: let the default picker find an idle CPU. */
+    if (target_ctx->cpu_prefer == CPU_NO_PREFER && target_ctx->kind == 0) {
+        bool is_idle;
+        cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+    } else {
+        /* Fast/slow preference: scan CPUs in the preferred speed order and claim
+        * the first idle one that fits kind + affinity. */
+        const volatile u8 *order = (target_ctx->cpu_prefer == CPU_FAST_PREFER)
+                                ? cpus_fast_to_slow : cpus_slow_to_fast;
+        cpu = pick_idle_in_order(p, target_ctx, order);
+    }
+
+    if (cpu >= 0) {
         scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, target_ctx->slice, wake_flags);
         return cpu;
     }
@@ -344,8 +400,17 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
 
         /* Only apply the cpu_kind setting when the task is not bound
          * to a specific CPU. */
-        if (BPF_CORE_READ(p, nr_cpus_allowed) == (s32)cpu_num) 
+        if (BPF_CORE_READ(p, nr_cpus_allowed) == (s32)cpu_num)
             target_ctx->kind = update_info->kind;
+
+        target_ctx->cpu_prefer = update_info->cpu_prefer;
+        if (target_ctx->cpu_prefer == CPU_NO_PREFER) {
+            if (target_ctx->kind == FASTEST_KIND)
+                target_ctx->cpu_prefer = CPU_FAST_PREFER;
+            else if (target_ctx->kind == SLOWEST_KIND)
+                target_ctx->cpu_prefer = CPU_SLOW_PREFER;
+        }
+
         bpf_map_delete_elem(&update_map, &key);
     }
 

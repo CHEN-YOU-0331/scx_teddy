@@ -61,6 +61,11 @@ struct ClusterSchedConfig {
     /// of `k` pins the cluster's tasks to the kind-only DSQ for kind `k`.
     #[serde(default)]
     cpu_kind: u8,
+    /// CPU speed preference for select_cpu: 0 = none, 1 = prefer fastest,
+    /// 2 = prefer slowest. Omitted (0) lets the BPF side auto-derive it from
+    /// cpu_kind when the kind is the fastest/slowest tier.
+    #[serde(default)]
+    cpu_prefer: u8,
     #[serde(flatten)]
     slice: SliceConfig,
 }
@@ -407,6 +412,7 @@ struct TaskSnapshot {
     prio: i32,
     slice_ns: u64,
     cpu_kind: u8,
+    cpu_prefer: u8,
 }
 
 /// Atomically publish the cycle's snapshot: write a sibling `.tmp` then rename
@@ -492,15 +498,19 @@ fn run_classify_cycle(
         let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
 
         snapshot.push(TaskSnapshot {
-            tid, cluster, prio, slice_ns, cpu_kind: cluster_cfg.cpu_kind,
+            tid, cluster, prio, slice_ns,
+            cpu_kind: cluster_cfg.cpu_kind,
+            cpu_prefer: cluster_cfg.cpu_prefer,
         });
 
-        // Write sched_info_t {prio: s32, kind: u8, slice: u64} to update_map.
-        // C layout (8-byte aligned): prio[0..4] | kind[4] | pad[5..8] | slice[8..16]
+        // Write sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}
+        // to update_map. C layout (8-byte aligned):
+        //   prio[0..4] | kind[4] | cpu_prefer[5] | pad[6..8] | slice[8..16]
         let tid_key = tid.to_ne_bytes();
         let mut val_buf = [0u8; 16];
         val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
         val_buf[4] = cluster_cfg.cpu_kind;
+        val_buf[5] = cluster_cfg.cpu_prefer;
         val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
         update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
     }

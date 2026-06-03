@@ -31,25 +31,32 @@ typedef signed long s64;
  * to bound the DSQ-creation loop for the verifier; real hardware has 1-3. */
 #define MAX_CPU_KIND 8
 
+#define CPU_NO_PREFER 0
+#define CPU_FAST_PREFER 1
+#define CPU_SLOW_PREFER 2
+
 /* Per-CPU topology */
 typedef struct cpu_info {
-    u8 cpu_kind;  // 0 = fastest kind
+    u8 cpu_kind;  // 1 = fastest kind
     u32 freq_n;   // numerator   = this CPU's max_freq (kHz)
     u32 freq_d;   // denominator = fastest CPU's max_freq (kHz)
 } cpu_info_t;
 
 typedef struct task_info {
-    s32 prio; // 0, 1, 2, 3
+    s32 prio;
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
+    u8 cpu_prefer;
     u64 slice; // ns
 } sched_info_t;
 
 typedef struct target_ctx {
-    s32 prio; // 0, 1, 2, 3
+    s32 prio;
     u64 slice; // ns
     u8 config;
     /* | 7 bits NOP | 1 bits ecore |*/
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
+    u8 cpu_prefer;
+
     u64 start_running;
     u64 sleep_start;
     u64 sleep_end;
