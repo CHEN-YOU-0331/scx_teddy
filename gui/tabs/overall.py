@@ -3,10 +3,13 @@
 htop-like dashboard: total CPU/RAM, per-CPU strip, top-N task table.
 
 Data source is entirely `/proc` (via sys_metrics.Sampler) — scx_teddy is
-NOT involved in sampling. The table reserves columns for scx_teddy-side
-state (tier / slice / cluster) but fills them with '—' until a real export
-mechanism exists. We deliberately don't ask scx_teddy to publish per-second
-state just for the dashboard.
+NOT involved in sampling. The cluster / prio / cpu_kind / slice columns are
+joined in by tid from scx_teddy's classify snapshot (`runner.read_snapshot()`),
+if one exists: those are the only fields /proc can't give us. No classify run
+(or a task that stayed asleep this cycle, so it isn't in the snapshot) → that
+task's scx_teddy columns stay blank. We deliberately don't ask scx_teddy to publish any
+*extra* per-second state for the dashboard — the snapshot is the same data the
+scheduler already computes each classify cycle.
 
 Refresh model: the Streamlit script reruns every ~1 s (sleep+rerun loop in
 app.py); on each rerun this tab calls `sampler.sample()` once. Sampler is
@@ -25,6 +28,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import scx_runner as runner
 import sys_metrics
 import sys_topology
 
@@ -135,14 +139,14 @@ def render():
     with c1:
         st.metric("Total CPU", f"{snap.cpu_total_pct:.1f}%")
         st.plotly_chart(_sparkline(cpu_hist, CPU_LINE),
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False})
     with c2:
         st.metric("RAM used",
                   f"{snap.ram_used_mb/1024:.1f} / "
                   f"{snap.ram_total_mb/1024:.0f} GB")
         st.plotly_chart(_sparkline(ram_hist, RAM_LINE),
-                        use_container_width=True,
+                        width="stretch",
                         config={"displayModeBar": False})
     with c3:
         st.metric("Active tasks", f"{len(snap.tasks)}")
@@ -164,7 +168,7 @@ def render():
     st.markdown(f"##### Per-CPU utilisation · {_group_legend_md(groups)}",
                 unsafe_allow_html=True)
     st.plotly_chart(_per_cpu_strip(snap.per_cpu_pct, groups),
-                    use_container_width=True,
+                    width="stretch",
                     config={"displayModeBar": False})
 
     # ---- Filters ---------------------------------------------------------
@@ -219,34 +223,68 @@ def render():
     # The scx_teddy-side fields are placeholder dashes — present so the
     # column layout matches the eventual real version and reviewers can see
     # "this is where tier/cluster will live".
+    # Classify snapshot, keyed by tid — but only trust it when THIS GUI session
+    # is the one running classify. The snapshot file lingers in /tmp after a run
+    # ends, so reading it unconditionally would show stale data from a previous
+    # run (e.g. right after reopening the GUI). The live classify handle in
+    # session_state is the authority: no handle (or it exited) → no snapshot,
+    # columns stay blank. Reopening the GUI clears session_state, so a leftover
+    # file is correctly ignored.
+    classify_handle = st.session_state.get("classify_handle")
+    classify_live = classify_handle is not None and classify_handle.is_running()
+    snapshot = (runner.read_snapshot() or {}) if classify_live else {}
+
     top = sorted(filtered, key=lambda t: t.cpu_pct, reverse=True)
-    rows = [{
-        "tid": t.tid,
-        "tgid": t.tgid,
-        "comm": t.comm,
-        "ppid": t.ppid,
-        "CPU%": round(t.cpu_pct, 1),
-        "RAM(MB)": round(t.ram_mb, 1),
-        # Placeholder columns — see module docstring.
-        "tier": "—",
-        "slice(ms)": "—",
-        "cluster": "—",
-    } for t in top]
+    rows = []
+    for t in top:
+        s = snapshot.get(t.tid)
+        rows.append({
+            "tid": t.tid,
+            "tgid": t.tgid,
+            "comm": t.comm,
+            "ppid": t.ppid,
+            "CPU%": round(t.cpu_pct, 1),
+            "RAM(MB)": round(t.ram_mb, 1),
+            # Joined from the classify snapshot by tid. Use None (not "—") for
+            # the miss case so each column keeps one numeric dtype — a mixed
+            # str/float column can't serialize to Arrow. Streamlit renders a
+            # missing numeric cell as a blank, which reads the same as a dash.
+            "cluster": s["cluster"] if s else None,
+            "prio": s["prio"] if s else None,
+            "cpu_kind": s["cpu_kind"] if s else None,
+            "slice(ms)": round(s["slice_ns"] / 1e6, 3) if s else None,
+        })
     df = pd.DataFrame(rows)
     if filter_active:
         header = (f"##### {len(filtered)} matching tasks "
                   f"of {len(snap.tasks)} · sorted by CPU%")
     else:
         header = f"##### {len(snap.tasks)} tasks · sorted by CPU%"
-    st.markdown(header +
-                "  <span style='color:#888;font-size:0.85rem'>"
-                "(tier / slice / cluster pending scx_teddy export)</span>",
-                unsafe_allow_html=True)
+    if classify_live:
+        note = (f"  <span style='color:#888;font-size:0.85rem'>"
+                f"(cluster / prio / cpu_kind / slice from classify snapshot · "
+                f"{len(snapshot)} tasks classified this cycle)</span>")
+    else:
+        note = ("  <span style='color:#888;font-size:0.85rem'>"
+                "(cluster / prio / cpu_kind / slice blank — classify not "
+                "running in this session)</span>")
+    st.markdown(header + note, unsafe_allow_html=True)
     st.dataframe(
-        df, use_container_width=True, hide_index=True, height=560,
+        df, width="stretch", hide_index=True, height=560,
         column_config={
             "CPU%": st.column_config.ProgressColumn(
                 "CPU%", min_value=0, max_value=100, format="%.1f%%"),
             "RAM(MB)": st.column_config.NumberColumn("RAM(MB)", format="%.0f"),
+            "cluster": st.column_config.NumberColumn(
+                "cluster", help="KMeans cluster id this task was classified into."),
+            "prio": st.column_config.NumberColumn(
+                "prio", help="Scheduling priority from the config "
+                "(0 = highest, 11 = lowest)."),
+            "cpu_kind": st.column_config.NumberColumn(
+                "cpu_kind", help="CPU-kind binding (0 = any; 1-based, "
+                "1 = fastest)."),
+            "slice(ms)": st.column_config.NumberColumn(
+                "slice(ms)", format="%.3f",
+                help="Time slice granted to this task, in milliseconds."),
         },
     )

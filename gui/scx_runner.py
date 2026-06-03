@@ -213,6 +213,31 @@ def make_cluster_entry(prio: int = CONFIG_DEFAULT_PRIO,
             "cpu_kind": int(cpu_kind)}
 
 
+# Where classify mode publishes its per-cycle snapshot (see write_snapshot in
+# main.rs). Fixed path under tmpfs, independent of DEFAULT_DATA_DIR. The Overall
+# tab reads it to fill the tier/slice/cluster columns; absent = scx_teddy isn't
+# classifying, and those columns stay blank.
+SNAPSHOT_PATH = Path("/tmp/scx_teddy/snapshot.json")
+
+
+def read_snapshot() -> dict[int, dict] | None:
+    """Read the classify snapshot, keyed by tid for an O(1) join against the
+    /proc task list. Each value is {cluster, prio, slice_ns, cpu_kind}.
+
+    Returns None when there's nothing to show (file missing — no classify run —
+    or a transient read that lost the rename race / malformed). The caller
+    treats None and a tid-miss identically: leave the columns blank. Best-effort
+    by design; this is a live feed, a skipped frame just means stale-by-1s.
+    """
+    try:
+        import json
+        with open(SNAPSHOT_PATH) as f:
+            tasks = json.load(f)
+        return {int(t["tid"]): t for t in tasks}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def read_config(path: Path) -> tuple[dict, dict] | None:
     """Parse an existing scheduling config JSON into ({clusters}, default).
 
