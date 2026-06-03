@@ -118,8 +118,22 @@ def _group_legend_md(groups: list[sys_topology.CoreGroup]) -> str:
 
 def render():
     st.title("Overall · system pulse")
-
     _ensure_state()
+    _live_body()
+
+
+@st.fragment(run_every="1s")
+def _live_body():
+    """The auto-refreshing part of the tab. As a fragment with run_every, this
+    reruns itself every second WITHOUT rerunning the whole app — and only while
+    Overall is the visible tab. That's the whole point: previously a global
+    1 Hz st.rerun() (kept alive once Overall had ever been opened) would wipe
+    out half-typed text in the Collect/Train/Classify tabs. Scoping the refresh
+    to this fragment means typing elsewhere is no longer interrupted.
+
+    Everything stateful (Sampler, history deques) still lives in session_state
+    (seeded by _ensure_state before this is called), so it survives both
+    fragment reruns and tab switches."""
     sampler: sys_metrics.Sampler = st.session_state.overall_sampler
     groups: list[sys_topology.CoreGroup] = st.session_state.overall_groups
     cpu_hist: deque = st.session_state.overall_cpu_hist
@@ -173,22 +187,20 @@ def render():
 
     # ---- Filters ---------------------------------------------------------
     # Three optional filters: comm substring (case-insensitive), tgid list,
-    # ppid list. All-empty = show everything. Kept in session_state so they
-    # survive the per-second rerun loop (otherwise the user can never
-    # finish typing).
+    # ppid list. All-empty = show everything. Each widget owns its value via
+    # its own key (no value= seed) — these live inside the 1 Hz fragment, so
+    # passing value=session_state[key] would let a refresh clobber a half-typed
+    # filter on the next tick. Key-only state survives the fragment reruns.
     st.markdown("##### Filter")
     f1, f2, f3 = st.columns(3)
     comm_q = f1.text_input(
-        "comm contains", value=st.session_state.get("ov_comm", ""),
-        placeholder="e.g. firefox", key="ov_comm",
+        "comm contains", placeholder="e.g. firefox", key="ov_comm",
         help="Case-insensitive substring match against the task's comm.")
     tgid_q = f2.text_input(
-        "tgid in", value=st.session_state.get("ov_tgid", ""),
-        placeholder="e.g. 1234, 5678", key="ov_tgid",
+        "tgid in", placeholder="e.g. 1234, 5678", key="ov_tgid",
         help="Comma-separated tgids; empty = any.")
     ppid_q = f3.text_input(
-        "ppid in", value=st.session_state.get("ov_ppid", ""),
-        placeholder="e.g. 1, 4321", key="ov_ppid",
+        "ppid in", placeholder="e.g. 1, 4321", key="ov_ppid",
         help="Comma-separated ppids; empty = any.")
 
     def _parse_int_list(s: str) -> set[int]:

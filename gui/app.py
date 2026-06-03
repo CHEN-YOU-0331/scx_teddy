@@ -210,16 +210,11 @@ def _any_proc_running() -> bool:
     return False
 
 
-def _overall_active() -> bool:
-    """Has the Overall tab been opened this session? Once it has, we keep
-    nudging reruns so its sparklines / per-CPU strip animate. Streamlit
-    doesn't tell us which tab is *currently* visible, so this is a
-    pragmatic approximation: the cost of a rerun when the user is on
-    another tab is one extra script pass — cheap, no flicker, the other
-    tabs are idempotent."""
-    return "overall_sampler" in st.session_state
-
-
-if _any_proc_running() or MOCK_TABS_ENABLED or _overall_active():
-    _time.sleep(1.0 if (MOCK_TABS_ENABLED or _overall_active()) else 1.5)
+# Overall no longer drives a global rerun: it self-refreshes via an
+# @st.fragment(run_every="1s") in tabs/overall.py, scoped to that tab only, so
+# typing in other tabs is never interrupted. The global rerun below remains
+# only for the Collect/Train/Classify log streams (a background reader thread
+# writes lines into session_state and Streamlit won't rerun on its own).
+if _any_proc_running() or MOCK_TABS_ENABLED:
+    _time.sleep(1.0 if MOCK_TABS_ENABLED else 1.5)
     st.rerun()
