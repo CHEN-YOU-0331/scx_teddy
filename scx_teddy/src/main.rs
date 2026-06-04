@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 //! scx_teddy - A BPF scheduler based on task runtime characteristics
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
-use std::io::BufRead;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -25,7 +24,6 @@ use libbpf_rs::MapFlags;
 
 mod classifier;
 mod task_stats;
-mod game_task_finder;
 mod topology;
 
 use task_stats::TaskStats;
@@ -141,6 +139,13 @@ struct Args {
     /// Path to scheduling config JSON (classify mode)
     #[arg(long)]
     config: Option<String>,
+
+    /// How often (seconds) to re-read the control file for the specialization
+    /// target ppid. An external scanner writes a ppid (or 0 to clear) into
+    /// /tmp/scx_teddy/control; scx_teddy polls it at this interval. Deliberately
+    /// coarse — the scan is meant to be cheap and slightly laggy is fine.
+    #[arg(long, default_value_t = 5)]
+    control_interval: u64,
 }
 
 unsafe impl Plain for TaskEvent {}
@@ -174,8 +179,7 @@ type StatsMap = Rc<RefCell<HashMap<i32, RefCell<TaskStats>>>>;
 
 /// Process-progress logger. When `--verbose` is set it opens a log file and
 /// every `log!` call appends a line to it; otherwise it holds `None` and
-/// `log!` is a no-op. Keeping it quiet by default leaves the terminal free
-/// for the Steam-scan interactive interface on the scan thread.
+/// `log!` is a no-op. Quiet by default keeps the terminal clean.
 struct Logger {
     file: Option<std::fs::File>,
 }
@@ -222,7 +226,7 @@ macro_rules! log {
 fn process_event(
     data: &[u8],
     stats: &StatsMap,
-    tracker: &Arc<game_task_finder::GameTracker>,
+    target_ppid: &Cell<i32>,
 ) -> i32 {
     let event = plain::from_bytes::<TaskEvent>(data).unwrap();
 
@@ -235,26 +239,19 @@ fn process_event(
             .or_insert_with(|| RefCell::new(TaskStats::new(initial_ancestor)));
         cell.borrow_mut().update(event);
     } else if event.parent == -1 {
-        // A task exited. Two game-detection consequences:
-        //
-        // 1. If the dying task IS the tracked game's PPID, the game ended
-        //    for real — clear the tracker and wake the scan thread. This
-        //    is the reliable signal; the alive-count path below depends on
-        //    the ancestor having converged via climb_one_step and on every
-        //    game-family task actually firing an exit event, neither of
-        //    which is guaranteed in time.
-        // 2. Otherwise, if the ancestor has converged to the tracked PPID,
-        //    decrement the alive count as a fallback signal (transient
-        //    cutscene drops still go through here).
-        let tracked = tracker.game_ppid.load(Ordering::Acquire);
-        if tracked != 0 && event.tid == tracked {
-            tracker.clear();
-            tracker.signal_wake();
+        // A task exited. If the dying task IS the specialization target ppid,
+        // the target is gone for real — clear it. This is the reliable
+        // self-death signal; the scanner will eventually publish a new target
+        // (or 0) via the control file, but clearing here makes the scheduler
+        // stop specializing the moment the target dies, without waiting for the
+        // next control poll. process_event runs on the main thread (it's the
+        // ringbuf callback), same as the control poll, so a plain Cell is
+        // enough — no atomics, no cross-thread sharing.
+        if target_ppid.get() != 0 && event.tid == target_ppid.get() {
+            target_ppid.set(0);
         }
         if let Some(cell) = stats.get(&event.tid) {
-            let mut ts = cell.borrow_mut();
-            ts.exit = 1;
-            tracker.note_process_exit(ts.ancestor);
+            cell.borrow_mut().exit = 1;
         }
     }
 
@@ -294,8 +291,8 @@ fn read_proc_comm(tid: i32) -> String {
 }
 
 /// Format one task's stats into a CSV row. `ancestor` is the Union-Find
-/// root from `climb_to_root` (1 = not game, or the tracked game PPID), not
-/// the real parent — so it comes from TaskStats, not /proc.
+/// root from `climb_to_root` (1 = not a target descendant, or the target
+/// PPID), not the real parent — so it comes from TaskStats, not /proc.
 fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
     let tgid = read_proc_field(tid, "Tgid")
         .map(|v| v.to_string()).unwrap_or_default();
@@ -327,13 +324,13 @@ fn collect_data(
     stats_map: &HashMap<i32, RefCell<TaskStats>>,
     output: &str,
     min_events: u64,
-    game_ppid: i32,
+    target_ppid: i32,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter_map(|(&tid, cell)| {
             let mut ts = cell.borrow_mut();
             if ts.exit == 0 && ts.event_count >= min_events {
-                climb_to_root(&mut ts, stats_map, game_ppid);
+                climb_to_root(&mut ts, stats_map, target_ppid);
                 Some((tid, task_csv_row(tid, &ts)))
             } else {
                 None
@@ -344,7 +341,7 @@ fn collect_data(
 }
 
 /// Advance one task's Union-Find ancestor pointer by ONE halving step
-/// toward the parent-chain root (init=1 or `game_ppid`).
+/// toward the parent-chain root (init=1 or `target_ppid`).
 ///
 /// Caller holds a `&mut TaskStats` (already borrowed from the HashMap
 /// entry via `RefCell::borrow_mut`) and the `&HashMap` (immutable, from
@@ -357,14 +354,14 @@ fn collect_data(
 /// Halving: `ts.ancestor = stats[ts.ancestor].ancestor`. If the
 /// intermediate pid is not in `stats_map` (it never sent an event but
 /// lives in the kernel), fall back to `/proc/<ancestor>/status`'s PPid.
-/// /proc failure defaults to 1 (conservative: "not game").
+/// /proc failure defaults to 1 (conservative: "not a target descendant").
 ///
 /// "Already converged → skip" is the CALLER's job: when `ts.ancestor` is
-/// already 1 or `game_ppid` the caller should not invoke this at all.
+/// already 1 or `target_ppid` the caller should not invoke this at all.
 fn climb_one_step(
     ts: &mut TaskStats,
     stats_map: &HashMap<i32, RefCell<TaskStats>>,
-    game_ppid: i32,
+    target_ppid: i32,
 ) {
     let a = ts.ancestor;
     let new_a = match stats_map.get(&a) {
@@ -372,25 +369,25 @@ fn climb_one_step(
         None => read_proc_field(a, "PPid").unwrap_or(1),
     };
     // /proc can return PPid 0 for kernel-thread family (parent is
-    // kthreadd / swapper). Fold to 1 so the climb has a single non-game
+    // kthreadd / swapper). Fold to 1 so the climb has a single non-target
     // root.
     ts.ancestor = if new_a == 0 { 1 } else { new_a };
 }
 
-/// Climb `ts.ancestor` to a root (1 or `game_ppid`) in one call, for
+/// Climb `ts.ancestor` to a root (1 or `target_ppid`) in one call, for
 /// `collect_data` which runs once and can't converge over cycles. The step
 /// cap guards against a cycle in the ancestor pointers.
 fn climb_to_root(
     ts: &mut TaskStats,
     stats_map: &HashMap<i32, RefCell<TaskStats>>,
-    game_ppid: i32,
+    target_ppid: i32,
 ) {
     const MAX_STEPS: usize = 4096;
     for _ in 0..MAX_STEPS {
-        if ts.ancestor == 1 || (game_ppid != 0 && ts.ancestor == game_ppid) {
+        if ts.ancestor == 1 || (target_ppid != 0 && ts.ancestor == target_ppid) {
             return;
         }
-        climb_one_step(ts, stats_map, game_ppid);
+        climb_one_step(ts, stats_map, target_ppid);
     }
     ts.ancestor = 1;
 }
@@ -400,6 +397,34 @@ fn climb_to_root(
 /// This is purely a GUI feed — scx_teddy works identically with no reader.
 const SNAPSHOT_DIR: &str = "/tmp/scx_teddy";
 const SNAPSHOT_PATH: &str = "/tmp/scx_teddy/snapshot.json";
+
+/// Control file: an external scanner writes the specialization target ppid here
+/// (a single integer, or 0 to clear). scx_teddy creates it (initialised to 0)
+/// before loading BPF and removes it on shutdown, and re-reads it every
+/// `--control-interval` seconds. The trivial "one ppid per file" format lets a
+/// scanner in any language drive specialization: decide a ppid however you like
+/// (Steam scan, comm match, cgroup, …) and `echo` it into this file.
+const CONTROL_PATH: &str = "/tmp/scx_teddy/control";
+
+/// Create the control file initialised to "0" (no target). Called before BPF
+/// load so a scanner can write to it from the very start. Errors are returned
+/// so startup can surface them.
+fn init_control_file() -> std::io::Result<()> {
+    std::fs::create_dir_all(SNAPSHOT_DIR)?;
+    std::fs::write(CONTROL_PATH, "0")
+}
+
+/// Read the target ppid from the control file. Returns Some(ppid) only for a
+/// well-formed non-negative integer (0 = clear); any other content — empty, a
+/// torn write, garbage, a negative — yields None, and the caller keeps the
+/// current target unchanged. Best-effort: a missing file also yields None.
+fn read_control_target() -> Option<i32> {
+    let s = std::fs::read_to_string(CONTROL_PATH).ok()?;
+    match s.trim().parse::<i32>() {
+        Ok(v) if v >= 0 => Some(v),
+        _ => None,
+    }
+}
 
 /// One task's scheduling state at the end of a classify cycle. Only the fields
 /// the GUI can't get from /proc itself — it already reads comm/tgid/ppid live
@@ -439,9 +464,10 @@ fn write_snapshot(tasks: &[TaskSnapshot], logger: &Rc<RefCell<Logger>>) {
 /// the last cycle are processed (`take_features_if_needed`).
 ///
 /// Each task that hasn't already converged also gets ONE Union-Find
-/// halving step on its `ancestor` pointer toward the game-detection root
-/// (1 = init / not game, or `game_ppid` = tracked game). One cycle per
-/// second means an N-deep chain converges in N cycles, which is fine.
+/// halving step on its `ancestor` pointer toward the specialization root
+/// (1 = init / not a target descendant, or `target_ppid` = the specialization
+/// target). One cycle per second means an N-deep chain converges in N cycles,
+/// which is fine.
 ///
 /// Loop shape: thanks to per-entry `RefCell<TaskStats>` we can `iter()`
 /// the map (immutable borrow of the whole HashMap) AND `borrow_mut()`
@@ -456,7 +482,7 @@ fn run_classify_cycle(
     classifier: &dyn classifier::Classifier,
     cfg: &SchedConfig,
     min_events: u64,
-    tracker: &game_task_finder::GameTracker,
+    target_ppid: i32,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     let n = classifier.n_clusters();
@@ -470,8 +496,6 @@ fn run_classify_cycle(
     let cpu_start = thread_cpu_time();
     let mut predict_count: usize = 0;
 
-    let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
-
     for (&tid, cell) in stats_map.iter() {
         let mut ts = cell.borrow_mut();
         if ts.exit != 0 || ts.event_count < min_events {
@@ -479,8 +503,8 @@ fn run_classify_cycle(
         }
 
         // One halving step, only when not yet converged.
-        if ts.ancestor != 1 && (game_ppid == 0 || ts.ancestor != game_ppid) {
-            climb_one_step(&mut ts, stats_map, game_ppid);
+        if ts.ancestor != 1 && (target_ppid == 0 || ts.ancestor != target_ppid) {
+            climb_one_step(&mut ts, stats_map, target_ppid);
         }
 
         let Some((features, named_stats)) = ts.take_features_if_needed() else {
@@ -611,7 +635,7 @@ fn main() -> Result<()> {
     }
 
     // Process-progress logger: quiet unless --verbose, in which case every
-    // log! call goes to a file. The terminal is left for the Steam-scan UI.
+    // log! call goes to a file.
     let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
 
     // Load model and config for classify mode
@@ -635,6 +659,10 @@ fn main() -> Result<()> {
     };
 
     log!(logger, "scx_teddy scheduler starting...");
+
+    // Create the control file (initialised to 0 = no target) before loading BPF,
+    // so an external scanner can write a target ppid from the very start.
+    init_control_file().context("Failed to create control file")?;
 
     // Build and load eBPF skeleton
     let skel_builder = BpfSkelBuilder::default();
@@ -671,19 +699,21 @@ fn main() -> Result<()> {
         .attach_struct_ops()
         .context("Failed to attach struct_ops")?;
 
-    // Shared game-tracking state. `process_event` (scheduler hot path) and the
-    // scan thread both touch it; the atomics inside keep the hot path lock-free.
-    let tracker = Arc::new(game_task_finder::GameTracker::new());
+    // Specialization target ppid. Driven by an external scanner via the control
+    // file (polled below) and cleared by process_event when the target dies.
+    // Both live on the main thread — process_event is the ringbuf callback — so
+    // a plain Rc<Cell<i32>> is enough; no atomics, no scan thread. 0 = none.
+    let target_ppid: Rc<Cell<i32>> = Rc::new(Cell::new(0));
 
     // Statistics storage
     let stats: StatsMap = Rc::new(RefCell::new(HashMap::new()));
     let stats_clone = Rc::clone(&stats);
-    let tracker_rb = Arc::clone(&tracker);
+    let target_rb = Rc::clone(&target_ppid);
 
     let mut builder = libbpf_rs::RingBufferBuilder::new();
     builder
         .add(&skel.maps.events,
-             move |data| process_event(data, &stats_clone, &tracker_rb))
+             move |data| process_event(data, &stats_clone, &target_rb))
         .context("Failed to add ringbuf")?;
     let ringbuf = builder.build().context("Failed to build ringbuf")?;
 
@@ -692,44 +722,24 @@ fn main() -> Result<()> {
 
     log!(logger, "scx_teddy scheduler loaded successfully!");
 
-    // Shutdown flag: set by Ctrl+C, watched by the main loop and the scan
-    // thread. The scan thread may be asleep inside `watch`, so the handler
-    // also wakes it via the tracker.
+    // Shutdown flag: set by Ctrl+C, watched by the main loop.
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ctrlc = Arc::clone(&shutdown);
-    let tracker_ctrlc = Arc::clone(&tracker);
     ctrlc::set_handler(move || {
         shutdown_ctrlc.store(true, Ordering::Release);
-        tracker_ctrlc.signal_wake();
     })
     .expect("Error setting Ctrl+C handler");
-
-    // Steam game-detection thread. `watch()` blocks on select(2)/stdin and
-    // then sleeps while a game runs, so it runs on its own thread. It owns
-    // nothing of the Rc-based scheduler state; it shares only the tracker
-    // (atomics + condvar) and the shutdown flag, both Arc-cloned in.
-    let tracker_scan = Arc::clone(&tracker);
-    let shutdown_scan = Arc::clone(&shutdown);
-    let scan_thread = thread::spawn(move || {
-        game_task_finder::watch(
-            game_task_finder::WatchConfig::default(),
-            &tracker_scan,
-            &shutdown_scan,
-            |trigger, m| {
-                let src = match trigger {
-                    game_task_finder::Trigger::GameName(name) =>
-                        format!("game-name '{name}'"),
-                    game_task_finder::Trigger::Timer => "steam-env scan".to_string(),
-                };
-                println!("[steam] game detected via {src}: ppid={} ({} processes)",
-                    m.ppid, m.procs.len());
-            },
-        );
-    });
 
     let mut start_time = Instant::now();
     let duration = Duration::from_secs(args.collect_duration);
     let collect_mode = model.is_none();
+
+    // Control-file poll timer. Independent of the classify/collect `duration`:
+    // every `control_interval` seconds we re-read the target ppid that an
+    // external scanner publishes. Coarse on purpose (the scan is cheap and
+    // a little lag is fine). First check fires immediately.
+    let control_interval = Duration::from_secs(args.control_interval);
+    let mut last_control_check = Instant::now() - control_interval;
 
     // Overall run-time limit (collect mode only): once this deadline passes the
     // loop stops and the CSV is flushed. None means no limit.
@@ -744,6 +754,21 @@ fn main() -> Result<()> {
         && !scx_utils::uei_exited!(&skel, uei)
         && run_deadline.is_none_or(|d| Instant::now() < d)
     {
+        // Re-read the control file for a new target ppid. A well-formed value
+        // (incl. 0 = clear) replaces the target; anything else leaves it as-is.
+        // process_event may also have cleared it (target self-death) since the
+        // last poll — that's fine, the next valid control value just sets it
+        // again. Both writers are on this thread, so no synchronization.
+        if last_control_check.elapsed() >= control_interval {
+            if let Some(ppid) = read_control_target() {
+                if ppid != target_ppid.get() {
+                    target_ppid.set(ppid);
+                    log!(logger, "control: target ppid -> {}", ppid);
+                }
+            }
+            last_control_check = Instant::now();
+        }
+
         if start_time.elapsed() >= duration {
             // Pause pushing events into the ring buffer while this cycle runs,
             // so the buffer cannot overflow during prediction / CSV work.
@@ -752,12 +777,13 @@ fn main() -> Result<()> {
 
             if let (Some(classifier), Some(cfg)) = (&model, &sched_config) {
                 run_classify_cycle(&stats.borrow(), update_map,
-                    classifier.as_ref(), cfg, args.min_events, &tracker, &logger)?;
+                    classifier.as_ref(), cfg, args.min_events,
+                    target_ppid.get(), &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
-                let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
-                let n = collect_data(&stats.borrow(), &args.output, args.min_events, game_ppid)?;
+                let n = collect_data(&stats.borrow(), &args.output,
+                    args.min_events, target_ppid.get())?;
                 log!(logger, "CSV written: {} rows", n);
             }
 
@@ -769,19 +795,14 @@ fn main() -> Result<()> {
 
     log!(logger, "scx_teddy scheduler exiting...");
 
-    // Stop the scan thread. The loop may have exited via run_deadline or a UEI
-    // rather than Ctrl+C, in which case `shutdown` is still false — set it and
-    // wake the scan thread out of any condvar wait. If it is instead blocked
-    // in select(2) on stdin, it sees `shutdown` after the current timeout
-    // (<= scan_interval_secs), so the join can take up to that long.
-    shutdown.store(true, Ordering::Release);
-    tracker.signal_wake();
-    let _ = scan_thread.join();
+    // Remove the control file so a stale target ppid can't be picked up by the
+    // next run. Best-effort: a missing file (already gone) is not an error.
+    let _ = std::fs::remove_file(CONTROL_PATH);
 
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
-        let game_ppid = tracker.game_ppid.load(Ordering::Acquire);
-        let n = collect_data(&stats.borrow(), &args.output, args.min_events, game_ppid)?;
+        let n = collect_data(&stats.borrow(), &args.output,
+            args.min_events, target_ppid.get())?;
         log!(logger, "CSV written: {} rows", n);
     }
 
