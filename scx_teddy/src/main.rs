@@ -365,7 +365,17 @@ fn climb_one_step(
 ) {
     let a = ts.ancestor;
     let new_a = match stats_map.get(&a) {
-        Some(parent_cell) => parent_cell.borrow().ancestor,
+        // The ancestor's `ancestor` pointer is only trustworthy if it was
+        // computed under the *current* target. If it's stale (converged under
+        // a previous target), don't follow it — step to the ancestor's *real*
+        // parent instead, walking the true tree past this not-yet-recomputed
+        // node rather than inheriting its outdated root. (Treating it as 1
+        // would be wrong: stale means "not recomputed yet", not "not a target
+        // descendant", and this task wouldn't get another chance to re-climb.)
+        Some(parent_cell) => {
+            let p = parent_cell.borrow();
+            if p.last_target == target_ppid { p.ancestor } else { p.real_ppid }
+        }
         None => read_proc_field(a, "PPid").unwrap_or(1),
     };
     // /proc can return PPid 0 for kernel-thread family (parent is
@@ -502,6 +512,15 @@ fn run_classify_cycle(
             continue;
         }
 
+        // If the target changed since this task last climbed, its `ancestor`
+        // converged under the old target and is stale. Restart the climb from
+        // the real parent. Done before the converged-check below so a task
+        // stuck at a root (e.g. 1) under the old target is freed to re-climb.
+        if ts.last_target != target_ppid {
+            ts.ancestor = ts.real_ppid;
+            ts.last_target = target_ppid;
+        }
+
         // One halving step, only when not yet converged.
         if ts.ancestor != 1 && (target_ppid == 0 || ts.ancestor != target_ppid) {
             climb_one_step(&mut ts, stats_map, target_ppid);
@@ -549,17 +568,6 @@ fn run_classify_cycle(
         (batch_cpu_us * 1000) / predict_count as u128
     } else { 0 };
 
-    log!(logger, "Classification results (updated {} tasks):",
-        cluster_tids.iter().map(|v| v.len()).sum::<usize>());
-    log!(logger, "  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
-        batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
-    for (i, tids) in cluster_tids.iter().enumerate() {
-        let cluster_cfg = cfg.clusters
-            .get(&i.to_string())
-            .unwrap_or(&cfg.default);
-        log!(logger, "  Cluster {} (prio={}, {} tasks)",
-            i, cluster_cfg.prio, tids.len());
-    }
     Ok(())
 }
 

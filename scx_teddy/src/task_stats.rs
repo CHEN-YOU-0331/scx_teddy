@@ -27,14 +27,24 @@ pub struct TaskStats {
     futex_wait_cnt: u64,
 
     pub event_count: u64,
-    /// Union-Find ancestor pointer toward the game-detection root.
+    /// Union-Find ancestor pointer toward the specialization root.
     /// Initialised from the task's real parent (carried in TaskEvent.parent
-    /// at first-seen time), then advanced toward 1 (init, "not game") or
-    /// `game_ppid` (the tracked game's root) by `climb_one_step` in main.rs.
-    /// Once it lands on either of those, the task is classified and the
-    /// field stops moving. NOT the real parent after the first climb —
-    /// use TaskEvent.parent if you need the raw kernel value.
+    /// at first-seen time), then advanced toward 1 (init, "not a target
+    /// descendant") or `target_ppid` by `climb_one_step` in main.rs. Once it
+    /// lands on either, the task is classified and the field stops moving —
+    /// until the target changes (see `last_target`). NOT the real parent
+    /// after the first climb — use `real_ppid` for the raw kernel value.
     pub ancestor: i32,
+    /// The task's real parent pid, captured once at first-seen time and never
+    /// touched by the climb. When the specialization target changes, `ancestor`
+    /// is reset to this so the climb can restart from the true tree instead of
+    /// staying stuck at a root it converged to under the *old* target.
+    pub real_ppid: i32,
+    /// The `target_ppid` value the last climb of this task used. When it no
+    /// longer matches the current target, this task's `ancestor` is stale
+    /// (converged under a different target) and must be re-climbed from
+    /// `real_ppid`. 0 means "never climbed under any target yet".
+    pub last_target: i32,
     pub exit: u8,
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.
@@ -44,7 +54,9 @@ pub struct TaskStats {
 impl TaskStats {
     /// Construct a fresh TaskStats. `ancestor` is seeded with the task's
     /// real parent (from TaskEvent.parent on the first enqueue) and will
-    /// then be collapsed toward `1` or `game_ppid` by `climb_one_step`.
+    /// then be collapsed toward `1` or `target_ppid` by `climb_one_step`.
+    /// The same value is kept verbatim in `real_ppid` so the climb can be
+    /// restarted from the true parent when the target changes.
     pub fn new(ancestor: i32) -> Self {
         Self {
             runtime_sum: 0,
@@ -59,6 +71,8 @@ impl TaskStats {
 
             event_count: 0,
             ancestor,
+            real_ppid: ancestor,
+            last_target: 0,
             exit: 0,
             need_update: 0,
         }
