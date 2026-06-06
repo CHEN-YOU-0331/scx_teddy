@@ -20,20 +20,32 @@ import theme
 def render():
     st.title("Static t-SNE · plot a collected CSV")
 
+    # --- CSV picker: /tmp dropdown OR a free-text path anywhere -------------
     csvs = runner.list_csvs()
     csv_names = [str(p) for p in csvs]
     # Default to the most recently produced CSV (may sit outside /tmp).
     default_csv = (str(runner.last_csv) if runner.last_csv is not None
                    else (csv_names[0] if csv_names else ""))
-    csv_path = st.selectbox(
-        "CSV",
-        options=csv_names if csv_names else [""],
-        index=csv_names.index(default_csv) if default_csv in csv_names else 0,
-        format_func=lambda s: s or "(no CSVs found)",
-        key="static_csv_pick")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        csv_custom = st.checkbox("Custom CSV path", value=False,
+                                 key="static_csv_custom")
+    with c2:
+        if csv_custom:
+            # Widget owns its value via key; seed once. Lets you point at a CSV
+            # outside /tmp (e.g. one collected straight to an SSD path).
+            st.session_state.setdefault("static_csv_text", default_csv)
+            csv_path = st.text_input("CSV path", key="static_csv_text",
+                                     label_visibility="collapsed")
+        else:
+            csv_path = st.selectbox(
+                "CSV",
+                options=csv_names if csv_names else [""],
+                index=csv_names.index(default_csv) if default_csv in csv_names else 0,
+                format_func=lambda s: s or "(no CSVs found — tick custom)",
+                label_visibility="collapsed", key="static_csv_pick")
 
-    # Optional cluster-result JSON. Default to the result file paired with
-    # the most-recently trained model, if present.
+    # --- Cluster-result JSON picker (optional): dropdown OR free-text path ---
     results = runner.list_files("model_*_result.json")
     result_names = ["(none — single colour)"] + [str(p) for p in results]
     default_result = ""
@@ -41,12 +53,23 @@ def render():
         rp = runner.result_path_for(runner.last_model)
         if rp.exists():
             default_result = str(rp)
-    result_idx = 0
-    if default_result in result_names:
-        result_idx = result_names.index(default_result)
-    result_choice = st.selectbox(
-        "Cluster result JSON (optional)",
-        options=result_names, index=result_idx, key="static_result_pick")
+    r1, r2 = st.columns([1, 3])
+    with r1:
+        result_custom = st.checkbox("Custom result path", value=False,
+                                    key="static_result_custom")
+    with r2:
+        if result_custom:
+            st.session_state.setdefault("static_result_text", default_result)
+            result_choice = st.text_input(
+                "Cluster result JSON path", key="static_result_text",
+                label_visibility="collapsed")
+        else:
+            result_idx = (result_names.index(default_result)
+                          if default_result in result_names else 0)
+            result_choice = st.selectbox(
+                "Cluster result JSON (optional)",
+                options=result_names, index=result_idx,
+                label_visibility="collapsed", key="static_result_pick")
 
     hl_text = st.text_input(
         "Highlight (field=ids, e.g. `tgid=1234,5678`)",
@@ -62,7 +85,7 @@ def render():
     if not plot_clicked:
         if "static_fig" in st.session_state:
             fig, caption = st.session_state["static_fig"]
-            st.plotly_chart(fig, use_container_width=True,
+            st.plotly_chart(fig, width="stretch",
                             config={"displayModeBar": True})
             st.caption(caption)
         else:
@@ -162,6 +185,6 @@ def render():
     # refresh) instead of being recomputed or blanked.
     caption = f"{len(df)} tasks · {len(feature_cols)} features"
     st.session_state["static_fig"] = (fig, caption)
-    st.plotly_chart(fig, use_container_width=True,
+    st.plotly_chart(fig, width="stretch",
                     config={"displayModeBar": True})
     st.caption(caption)
