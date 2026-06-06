@@ -74,6 +74,27 @@ struct SchedConfig {
     default: ClusterSchedConfig,
 }
 
+/// A model paired with the config that interprets its clusters. Classify mode
+/// holds a `default` set (non-target tasks) and an optional `target` set; the
+/// two are independent and may differ in cluster count. Not enforced here — an
+/// unknown cluster id falls back to the config's `default` entry; the GUI
+/// validates the model↔config pairing.
+struct SchedSet {
+    model: Box<dyn classifier::Classifier>,
+    config: SchedConfig,
+}
+
+/// Load a model + config into a SchedSet. Errors are returned so the caller can
+/// abort (startup) or keep the previous set (live control-file reload).
+fn load_sched_set(model_path: &str, config_path: &str) -> Result<SchedSet> {
+    let model = classifier::load_model(model_path)?;
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read config: {}", config_path))?;
+    let config: SchedConfig = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse config: {}", config_path))?;
+    Ok(SchedSet { model, config })
+}
+
 impl ClusterSchedConfig {
     /// Compute the slice in ns for a task given its named runtime stats.
     fn compute_slice_ns(&self, named_stats: &[(&str, f64)]) -> u64 {
@@ -139,6 +160,16 @@ struct Args {
     /// Path to scheduling config JSON (classify mode)
     #[arg(long)]
     config: Option<String>,
+
+    /// Target family's model JSON (classify mode, optional). When set, target
+    /// tasks use this model + --target-config instead of the defaults.
+    #[arg(long)]
+    target_model: Option<String>,
+
+    /// Target family's config JSON. Paired with --target-model; both required
+    /// for the target family to get its own scheduling.
+    #[arg(long)]
+    target_config: Option<String>,
 
     /// How often (seconds) to re-read the control file for the specialization
     /// target ppid. An external scanner writes a ppid (or 0 to clear) into
@@ -408,31 +439,90 @@ fn climb_to_root(
 const SNAPSHOT_DIR: &str = "/tmp/scx_teddy";
 const SNAPSHOT_PATH: &str = "/tmp/scx_teddy/snapshot.json";
 
-/// Control file: an external scanner writes the specialization target ppid here
-/// (a single integer, or 0 to clear). scx_teddy creates it (initialised to 0)
-/// before loading BPF and removes it on shutdown, and re-reads it every
-/// `--control-interval` seconds. The trivial "one ppid per file" format lets a
-/// scanner in any language drive specialization: decide a ppid however you like
-/// (Steam scan, comm match, cgroup, …) and `echo` it into this file.
-const CONTROL_PATH: &str = "/tmp/scx_teddy/control";
+/// Control files: an external scanner drives specialization by writing a single
+/// value into each, re-read every `--control-interval` seconds (a change is
+/// acted on, unchanged/unreadable is ignored). One value per file keeps each
+/// `echo`-able from any language; not a hot path, so three reads cost nothing.
+///   - control_ppid:   target ppid (integer, 0 = none)
+///   - control_model:  target family's model JSON path (empty = use default)
+///   - control_config: target family's config JSON path (empty = use default)
+const CONTROL_PPID_PATH: &str = "/tmp/scx_teddy/control_ppid";
+const CONTROL_MODEL_PATH: &str = "/tmp/scx_teddy/control_model";
+const CONTROL_CONFIG_PATH: &str = "/tmp/scx_teddy/control_config";
 
-/// Create the control file initialised to "0" (no target). Called before BPF
-/// load so a scanner can write to it from the very start. Errors are returned
-/// so startup can surface them.
-fn init_control_file() -> std::io::Result<()> {
+/// Create all three control files before BPF load so a scanner can drive
+/// scx_teddy from the start. control_ppid is seeded to "0"; model/config are
+/// seeded with the startup --target-* paths. Seeding model/config is essential:
+/// poll_target_set diffs each file against the last-seen value, so missing files
+/// would read "" on the first poll and wrongly drop the startup target.
+fn init_control_files(target_model: &str, target_config: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(SNAPSHOT_DIR)?;
-    std::fs::write(CONTROL_PATH, "0")
+    std::fs::write(CONTROL_PPID_PATH, "0")?;
+    std::fs::write(CONTROL_MODEL_PATH, target_model)?;
+    std::fs::write(CONTROL_CONFIG_PATH, target_config)
 }
 
-/// Read the target ppid from the control file. Returns Some(ppid) only for a
+/// Read the target ppid from control_ppid. Returns Some(ppid) only for a
 /// well-formed non-negative integer (0 = clear); any other content — empty, a
 /// torn write, garbage, a negative — yields None, and the caller keeps the
 /// current target unchanged. Best-effort: a missing file also yields None.
 fn read_control_target() -> Option<i32> {
-    let s = std::fs::read_to_string(CONTROL_PATH).ok()?;
+    let s = std::fs::read_to_string(CONTROL_PPID_PATH).ok()?;
     match s.trim().parse::<i32>() {
         Ok(v) if v >= 0 => Some(v),
         _ => None,
+    }
+}
+
+/// Read a control file holding a path. Returns the trimmed path, or "" if
+/// missing/blank (meaning "unset → use default").
+fn read_control_path(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_default().trim().to_string()
+}
+
+/// Reload the target SchedSet if either control path changed. Takes the current
+/// set by value and returns the one to use next cycle (unchanged paths return it
+/// untouched); `last_model`/`last_config` are updated in place.
+///
+/// Keep-old-on-error so a live scheduler is never disturbed: both paths set →
+/// load + validate, swap in on success else keep current; either empty → clear.
+fn poll_target_set(
+    current: Option<SchedSet>,
+    last_model: &mut String,
+    last_config: &mut String,
+    cpu_kind_num: u8,
+    logger: &Rc<RefCell<Logger>>,
+) -> Option<SchedSet> {
+    let m = read_control_path(CONTROL_MODEL_PATH);
+    let c = read_control_path(CONTROL_CONFIG_PATH);
+    if m == *last_model && c == *last_config {
+        return current; // no change
+    }
+    *last_model = m.clone();
+    *last_config = c.clone();
+
+    if m.is_empty() || c.is_empty() {
+        if current.is_some() {
+            log!(logger, "control: target set cleared -> default");
+        }
+        return None;
+    }
+
+    match load_sched_set(&m, &c) {
+        Ok(set) => match validate_config_kinds(&set.config, cpu_kind_num) {
+            Ok(()) => {
+                log!(logger, "control: target set -> {} + {}", m, c);
+                Some(set)
+            }
+            Err(e) => {
+                log!(logger, "control: target config rejected ({e}); keeping current");
+                current
+            }
+        },
+        Err(e) => {
+            log!(logger, "control: target reload failed ({e}); keeping current");
+            current
+        }
     }
 }
 
@@ -489,14 +579,12 @@ fn write_snapshot(tasks: &[TaskSnapshot], logger: &Rc<RefCell<Logger>>) {
 fn run_classify_cycle(
     stats_map: &HashMap<i32, RefCell<TaskStats>>,
     update_map: &libbpf_rs::Map,
-    classifier: &dyn classifier::Classifier,
-    cfg: &SchedConfig,
+    default_set: &SchedSet,
+    target_set: Option<&SchedSet>,
     min_events: u64,
     target_ppid: i32,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
-    let n = classifier.n_clusters();
-    let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
     // GUI Overall feed: one entry per task predicted this cycle (i.e. that
     // woke at least once since last cycle). Tasks that stayed asleep aren't
     // here — the GUI leaves their tier/slice/cluster columns blank.
@@ -526,16 +614,24 @@ fn run_classify_cycle(
             climb_one_step(&mut ts, stats_map, target_ppid);
         }
 
+        // Target family (ancestor converged to target) uses the target set if
+        // one exists; everything else uses the default.
+        let mut set = default_set;
+        if target_ppid != 0 && ts.ancestor == target_ppid {
+             if let Some(s) = target_set {
+                set = s;
+            }
+        }
+
         let Some((features, named_stats)) = ts.take_features_if_needed() else {
             continue;
         };
-        let cluster = classifier.predict(&features);
+        let cluster = set.model.predict(&features);
         predict_count += 1;
-        cluster_tids[cluster].push(tid);
 
-        let cluster_cfg = cfg.clusters
+        let cluster_cfg = set.config.clusters
             .get(&cluster.to_string())
-            .unwrap_or(&cfg.default);
+            .unwrap_or(&set.config.default);
 
         let prio = cluster_cfg.prio;
         let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
@@ -646,31 +742,48 @@ fn main() -> Result<()> {
     // log! call goes to a file.
     let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
 
-    // Load model and config for classify mode
-    let (model, sched_config) = if args.mode == "classify" {
+    // Load the default model + config for classify mode (required). The target
+    // set is optional and may also be set/changed later via the control files.
+    let default_set = if args.mode == "classify" {
         let model_path = args.model.as_deref()
             .context("Classify mode requires --model <path>")?;
-        let m = classifier::load_model(model_path)?;
-        log!(logger, "Loaded model from {} ({} clusters)", model_path, m.n_clusters());
-
         let config_path = args.config.as_deref()
             .context("Classify mode requires --config <path>")?;
-        let content = std::fs::read_to_string(config_path)
-            .with_context(|| format!("Failed to read config: {}", config_path))?;
-        let cfg: SchedConfig = serde_json::from_str(&content)
-            .context("Failed to parse scheduling config")?;
-        log!(logger, "Loaded scheduling config from {}", config_path);
-
-        (Some(m), Some(cfg))
+        let set = load_sched_set(model_path, config_path)?;
+        log!(logger, "Loaded default model {} ({} clusters) + config {}",
+            model_path, set.model.n_clusters(), config_path);
+        Some(set)
     } else {
-        (None, None)
+        None
     };
+
+    // Optional target set from startup flags: both --target-* must be present,
+    // else the target family falls back to default. Seed last_target_* so a
+    // control file matching the flags doesn't trigger a reload.
+    let mut target_set: Option<SchedSet> = None;
+    let mut last_target_model = String::new();
+    let mut last_target_config = String::new();
+    if args.mode == "classify" {
+        if let (Some(tm), Some(tc)) = (&args.target_model, &args.target_config) {
+            match load_sched_set(tm, tc) {
+                Ok(set) => {
+                    log!(logger, "Loaded target model {} ({} clusters) + config {}",
+                        tm, set.model.n_clusters(), tc);
+                    target_set = Some(set);
+                    last_target_model = tm.clone();
+                    last_target_config = tc.clone();
+                }
+                Err(e) => anyhow::bail!("Failed to load --target-model/--target-config: {e}"),
+            }
+        }
+    }
 
     log!(logger, "scx_teddy scheduler starting...");
 
-    // Create the control file (initialised to 0 = no target) before loading BPF,
-    // so an external scanner can write a target ppid from the very start.
-    init_control_file().context("Failed to create control file")?;
+    // Create the control files before loading BPF (see init_control_files for
+    // why model/config are seeded with the startup paths).
+    init_control_files(&last_target_model, &last_target_config)
+        .context("Failed to create control files")?;
 
     // Build and load eBPF skeleton
     let skel_builder = BpfSkelBuilder::default();
@@ -691,9 +804,12 @@ fn main() -> Result<()> {
 
     // Reject configs that bind a cluster to a CPU kind this machine doesn't
     // have, before load — otherwise those tasks land in a DSQ that no CPU ever
-    // pulls from and starve.
-    if let Some(cfg) = &sched_config {
-        validate_config_kinds(cfg, topo.cpu_kind_num)?;
+    // pulls from and starve. Both the default and (if present) target config.
+    if let Some(set) = &default_set {
+        validate_config_kinds(&set.config, topo.cpu_kind_num)?;
+    }
+    if let Some(set) = &target_set {
+        validate_config_kinds(&set.config, topo.cpu_kind_num)?;
     }
 
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
@@ -740,7 +856,7 @@ fn main() -> Result<()> {
 
     let mut start_time = Instant::now();
     let duration = Duration::from_secs(args.collect_duration);
-    let collect_mode = model.is_none();
+    let collect_mode = default_set.is_none();
 
     // Control-file poll timer. Independent of the classify/collect `duration`:
     // every `control_interval` seconds we re-read the target ppid that an
@@ -774,6 +890,12 @@ fn main() -> Result<()> {
                     log!(logger, "control: target ppid -> {}", ppid);
                 }
             }
+            // Reload the target set if its control paths changed (classify only).
+            if args.mode == "classify" {
+                target_set = poll_target_set(
+                    target_set, &mut last_target_model, &mut last_target_config,
+                    topo.cpu_kind_num, &logger);
+            }
             last_control_check = Instant::now();
         }
 
@@ -783,9 +905,9 @@ fn main() -> Result<()> {
             let key = 0u32.to_ne_bytes();
             scheduler_config.update(&key, &1u32.to_ne_bytes(), MapFlags::ANY)?;
 
-            if let (Some(classifier), Some(cfg)) = (&model, &sched_config) {
+            if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
-                    classifier.as_ref(), cfg, args.min_events,
+                    default_set, target_set.as_ref(), args.min_events,
                     target_ppid.get(), &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
@@ -803,9 +925,11 @@ fn main() -> Result<()> {
 
     log!(logger, "scx_teddy scheduler exiting...");
 
-    // Remove the control file so a stale target ppid can't be picked up by the
-    // next run. Best-effort: a missing file (already gone) is not an error.
-    let _ = std::fs::remove_file(CONTROL_PATH);
+    // Remove the control files so a stale target/model/config can't be picked
+    // up by the next run. Best-effort: a missing file is not an error.
+    let _ = std::fs::remove_file(CONTROL_PPID_PATH);
+    let _ = std::fs::remove_file(CONTROL_MODEL_PATH);
+    let _ = std::fs::remove_file(CONTROL_CONFIG_PATH);
 
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {

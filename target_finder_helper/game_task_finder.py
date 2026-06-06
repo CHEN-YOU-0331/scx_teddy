@@ -5,7 +5,7 @@ This is one example of an *external scanner*: a standalone program that decides
 which task family scx_teddy should specialize, and writes that family's ppid
 into the control file. scx_teddy itself does no scanning — it just re-reads
 
-    /tmp/scx_teddy/control
+    /tmp/scx_teddy/control_ppid
 
 every few seconds (see --control-interval) and treats the integer there as the
 specialization target (0 = none). So a scanner in ANY language can drive it:
@@ -13,6 +13,10 @@ decide a ppid however you like, then write it to that file. This one keys off
 Steam's environment marker, but swapping the detection logic (comm match,
 cgroup, window title, …) is just changing scan_once() — the contract with
 scx_teddy never changes.
+
+A scanner only ever writes the *ppid*. The two sibling control files that pick
+the target family's model/config (control_model, control_config) are left to the
+GUI or a manual `echo`; this scanner doesn't touch them.
 
 How it detects a game: Steam injects SteamGameId=<appid> (older: STEAM_GAME=)
 into every process it launches for a game. Reading /proc/<pid>/environ (a
@@ -45,7 +49,7 @@ STEAM_ENV_KEYS = ("SteamGameId", "STEAM_GAME")
 # excluded so it doesn't skew the per-ppid member counts.
 STEAM_INFRA = {"reaper", "srt-bwrap", "pv-adverb", "steam.exe"}
 
-CONTROL_PATH = "/tmp/scx_teddy/control"
+CONTROL_PATH = "/tmp/scx_teddy/control_ppid"
 SCAN_INTERVAL_SECS = 5
 
 

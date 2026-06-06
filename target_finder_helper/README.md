@@ -11,33 +11,48 @@ below is all you need to write your own.
 
 ## The control protocol
 
+scx_teddy watches three single-value files under `/tmp/scx_teddy/`, each
+re-read every `--control-interval` seconds (default 5):
+
 ```
-/tmp/scx_teddy/control   ← a single integer: the target ppid (0 = none)
+control_ppid     ← target ppid: a single integer (0 = none)
+control_model    ← path to the target family's model JSON  (empty = use default)
+control_config   ← path to the target family's config JSON (empty = use default)
 ```
 
-- scx_teddy **creates** this file (initialised to `0`) before loading BPF, and
-  **removes** it on shutdown.
-- scx_teddy **re-reads** it every `--control-interval` seconds (default 5).
-- A well-formed non-negative integer becomes the new target. `0` clears it.
-- Anything else (empty, garbage, a torn write, negative) is ignored — the
-  current target is kept. So a scanner that crashes mid-write does no harm.
-- scx_teddy also clears the target on its own the moment the target ppid dies
-  (it sees the exit event), without waiting for the next poll.
+One value per file so each is trivially `echo`-able from any language. They are
+read independently and a change in any one is acted on; this isn't a hot path.
 
-That's the entire contract. To write your own scanner: decide a ppid however you
-like, then write it to that file (atomically — `.tmp` + rename — so scx_teddy
-never reads a half-written value). Nothing in scx_teddy needs to change when you
-swap the detection logic.
+- scx_teddy **creates** all three before loading BPF and **removes** them on
+  shutdown. `control_ppid` is seeded to `0`; `control_model`/`control_config`
+  are seeded with the startup `--target-model`/`--target-config` paths (empty if
+  not given).
+- **`control_ppid`** — a well-formed non-negative integer becomes the new
+  target; `0` clears it. Anything else (empty, garbage, a torn write, negative)
+  is ignored, keeping the current target. So a scanner that crashes mid-write
+  does no harm. scx_teddy also clears the target on its own the moment the
+  target ppid dies (it sees the exit event), without waiting for the next poll.
+- **`control_model` + `control_config`** — when both are non-empty the target
+  family uses that model + config instead of the defaults; if either is empty
+  the target family falls back to the default set. A reload that fails to load
+  or validate keeps the currently-loaded set (the running scheduler is never
+  disturbed by a bad path).
+
+### Who writes what
+
+A **scanner** writes only `control_ppid` — its one job is to point at a family.
+Choosing the target family's model/config (`control_model`, `control_config`) is
+left to the GUI or a manual `echo`; the example scanner here does not touch
+them. The simplest scanner is one line:
 
 ```sh
-# the simplest possible scanner is one line:
-echo 1234 > /tmp/scx_teddy/control
+echo 1234 > /tmp/scx_teddy/control_ppid
 ```
 
 > **Needs root.** scx_teddy runs under `sudo` (it needs root for BPF), so it
-> creates `/tmp/scx_teddy/control` owned by root — a normal-user process can't
-> write it. Run your scanner with `sudo` too (e.g.
-> `sudo ./game_task_finder.py`, `echo 1234 | sudo tee /tmp/scx_teddy/control`).
+> creates the control files owned by root — a normal-user process can't write
+> them. Run your scanner with `sudo` too (e.g. `sudo ./game_task_finder.py`,
+> `echo 1234 | sudo tee /tmp/scx_teddy/control_ppid`).
 
 ## Tools
 
@@ -69,13 +84,13 @@ doesn't skew the counts.)
 ./game_task_finder.py 2      # scan every 2s
 ```
 
-Writes the game's ppid when one is running, `0` when none is, and `0` again on
-Ctrl-C so a stale target doesn't linger.
+Writes the game's ppid to `control_ppid` when one is running, `0` when none is,
+and `0` again on Ctrl-C so a stale target doesn't linger.
 
 ## Writing your own
 
 Any of these is a valid scanner — the detection is up to you, the output is
-always "a ppid in the control file":
+always "a ppid in `control_ppid`":
 
 - match on `comm` / `cmdline`
 - a process in a particular cgroup
@@ -85,8 +100,8 @@ always "a ppid in the control file":
 ```python
 import os
 def publish(ppid):
-    tmp = "/tmp/scx_teddy/control.tmp"
+    tmp = "/tmp/scx_teddy/control_ppid.tmp"
     with open(tmp, "w") as f:
         f.write(str(ppid))
-    os.replace(tmp, "/tmp/scx_teddy/control")  # atomic
+    os.replace(tmp, "/tmp/scx_teddy/control_ppid")  # atomic
 ```
