@@ -1,125 +1,140 @@
 # scx_teddy
 
-An eBPF-based experimental scheduler that collects task runtime behavior online, clusters tasks using ML models (K-means), and dynamically adjusts scheduling priorities and time slices per cluster.
+An eBPF-based (sched_ext) experimental scheduler and **framework** for studying
+per-task scheduling. It collects each task's runtime behaviour online, clusters
+tasks with an ML model (K-means), and applies a per-cluster scheduling policy —
+priority, time slice, and CPU-kind placement on hybrid (big.LITTLE) machines.
+
+The design goal is to make it *easy to collect data and easy to change the
+scheduling policy*: train a model on your own workload, write a small JSON
+policy, and run it — no recompilation. A Streamlit GUI wraps the whole loop (see
+[`gui/`](gui/README.md)).
 
 ## Requirements
 
 - Linux kernel with sched_ext support
-- Root privileges (required for eBPF operations)
-- Rust toolchain
-- libbpf
-- Python 3 with `numpy`, `pandas`, `scikit-learn` (for training)
+- Root privileges (eBPF)
+- Rust toolchain, libbpf
+- Python 3 with `numpy`, `pandas`, `scikit-learn` (training + GUI)
 
 ## Building
 
 ```bash
 cargo build --release
-```
-
-Install Python dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+## Modes
 
-scx_teddy operates in two modes: **collect** (gather task data) and **classify** (apply a trained model to schedule tasks).
+scx_teddy runs in two modes: **collect** (gather task data into a CSV) and
+**classify** (apply a trained model to schedule tasks live).
 
-### Step 1: Collect Task Data
-
-Run the scheduler in collect mode to record task behavior into a CSV file:
+### Step 1: Collect task data
 
 ```bash
 sudo ./target/release/scx_teddy -m collect -c 60 -o event.csv
 ```
 
 **Options:**
-- `-m, --mode <MODE>` - Operating mode: `collect` or `classify` (default: `collect`)
-- `-c, --collect-duration <SECONDS>` - Data collection interval in seconds (default: 600)
-- `-o, --output <PATH>` - Output CSV file path (default: `event.csv`)
-- `--min-events <N>` - Minimum event count to include a task (default: 3)
-- `--csv-checkpoint` - Write the CSV every collect cycle. By default the CSV is kept in memory and written only once on shutdown; enable this to checkpoint each cycle so a crash or `kill -9` does not lose the run's data.
-- `--max-runtime <SECONDS>` - Maximum total run time. Once reached, the in-memory CSV is written out and the scheduler exits. `0` means no limit (default: `0`).
-- `-v, --verbose` - Enable verbose output
+- `-m, --mode <MODE>` — `collect` or `classify` (default: `collect`)
+- `-c, --collect-duration <SECONDS>` — collect interval (default: 600)
+- `-o, --output <PATH>` — output CSV (default: `event.csv`)
+- `--min-events <N>` — minimum event count to include a task (default: 2)
+- `--csv-checkpoint` — write the CSV every cycle. By default it is kept in memory
+  and written once on shutdown; enable this so a crash / `kill -9` doesn't lose
+  the run.
+- `--max-runtime <SECONDS>` — stop after this long (writes the CSV and exits).
+  `0` = no limit (default: `0`).
+- `-v, --verbose` — verbose log to `teddy.log`
 
-### Step 2: Train a K-means Model
-
-Use the training script to cluster tasks based on their runtime characteristics:
+### Step 2: Train a K-means model
 
 ```bash
 python3 train.py event.csv -o model.json
 ```
 
-By default, all tasks in the CSV are used. To restrict training to specific workloads, pass a `train_config.config` file containing one comm prefix per line:
+To restrict training to specific workloads, pass a `--train-config` file with
+one `comm` prefix per line (lines starting with `#` and blanks are ignored):
 
 ```bash
 python3 train.py event.csv -o model.json --train-config train_config.config
 ```
 
-A sample `train_config.config` is provided that matches the workloads in `bench_mark.sh`:
-
-```
-# stress-ng workloads
-stress-ng-cpu
-stress-ng-hdd
-stress-ng-switc
-stress-ng-timer
-
-# custom workloads
-slow-timer
-random-timer
-fixed-mutex
-```
-
-Each line is matched by prefix against the task's `comm`. Lines starting with `#` and blank lines are ignored.
-
-This will:
-- Automatically select the number of clusters using the elbow method (or specify with `-k`)
-- Export the model (centroids + scaler) to a JSON file
-- Print per-cluster statistics and task membership (tid, tgid, ppid, command)
-- Save classification results to `model_result.json`
+This selects the cluster count via the elbow method (or `-k`), writes the model
+(centroids + scaler) to JSON, and writes `<model>_result.json` with per-cluster
+task membership (tid, tgid, ppid, command).
 
 **Options:**
-- `-o, --output <PATH>` - Output model JSON path (default: `model.json`)
-- `-k, --clusters <N>` - Number of clusters (auto-detect if not specified)
-- `--train-config <PATH>` - Comm prefix filter list (default: use all tasks)
-- `--filter-tid <TID...>` - Filter by tid(s)
-- `--filter-tgid <TGID...>` - Filter by tgid(s)
-- `--filter-cmd <CMD...>` - Filter by exact command name(s)
+- `-o, --output <PATH>` — output model JSON (default: `model.json`)
+- `-k, --clusters <N>` — number of clusters (auto if omitted)
+- `--train-config <PATH>` — comm-prefix filter list (default: all tasks)
+- `--filter-tid / --filter-tgid / --filter-cmd <…>` — filter the training set
 
-### Step 3: Configure Scheduling Policy
+### Step 3: Write a scheduling policy
 
-Create a `config.json` that maps each cluster to a priority and time slice policy:
+A `config.json` maps each cluster id to a scheduling entry, plus a `default`
+entry for clusters not listed (and for tasks scx_teddy can't place):
 
 ```json
 {
   "clusters": {
-    "0": { "prio": 2, "slice_mode": "adaptive", "slice_sigma": 1.0 },
-    "1": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 },
-    "4": { "prio": 0, "slice_mode": "adaptive", "slice_sigma": 2.0 }
+    "0": { "prio": 0,  "slice_mode": "fixed",    "slice_ns": 1500000, "cpu_kind": 1, "cpu_prefer": 1 },
+    "1": { "prio": 2,  "slice_mode": "fixed",    "slice_ns": 3000000 },
+    "6": { "prio": 11, "slice_mode": "adaptive", "slice_sigma": 1.0,  "cpu_prefer": 2 }
   },
-  "default": { "prio": 3, "slice_mode": "fixed", "slice_ns": 100000 }
+  "default": { "prio": 11, "slice_mode": "fixed", "slice_ns": 100000 }
 }
 ```
 
-- **prio**: Scheduling priority tier (0 = critical, 1 = interactive, 2 = normal, 3 = batch)
-- **slice_mode**:
-  - `adaptive`: time slice = avg_runtime + sigma * stddev_runtime (computed per task)
-  - `fixed`: time slice = fixed value in nanoseconds
+- **prio** — priority tier, `0` = highest, `11` = lowest (12 tiers). Tasks are
+  dispatched from `prio 0` down. `prio < 4` is treated as *critical*: those tasks
+  get an active idle-CPU search on wakeup (lowest latency); `prio >= 4` are just
+  enqueued.
+- **slice_mode** — `fixed` (`slice_ns`, floored at 100000) or `adaptive`
+  (`slice_sigma`: slice scales with the task's mean runtime and its variability).
+- **cpu_kind** *(hybrid machines)* — `0` (default) = shared, runnable on any CPU
+  kind; otherwise 1-based, `1` = fastest tier (P-core), higher = slower (E-core /
+  tier-N). scx_teddy discovers the kinds from cpufreq at startup and prints the
+  valid range.
+- **cpu_prefer** — `select_cpu` speed preference: `0` = none (auto-derived from
+  `cpu_kind`), `1` = prefer fastest, `2` = prefer slowest.
 
-### Step 4: Run with Classification
-
-Apply the trained model to dynamically classify tasks and update scheduling parameters:
+### Step 4: Run with classification
 
 ```bash
-sudo ./target/release/scx_teddy -m classify -c 60 --model model.json --config config.json
+sudo ./target/release/scx_teddy -m classify -c 1 --model model.json --config config.json
 ```
 
-**Additional options for classify mode:**
-- `--model <PATH>` - Path to trained model JSON (required)
-- `--config <PATH>` - Path to scheduling config JSON (required)
-- `-c, --collect-duration <SECONDS>` - Refresh interval in seconds (default: 600)
+**classify options:**
+- `--model <PATH>` / `--config <PATH>` — trained model + policy (both required)
+- `-c, --collect-duration <SECONDS>` — re-classify period (default: 600; the GUI
+  uses 1s for responsiveness)
+- `--target-model <PATH>` / `--target-config <PATH>` — an optional *second*
+  model + policy for the specialization target family (see below)
+- `--control-interval <SECONDS>` — how often to re-read the control files
+  (default: 5)
+
+## Specialization: optimizing one process family
+
+scx_teddy can give one process and all its descendants their own scheduling,
+distinct from the rest of the system — e.g. to prioritize a game's threads. The
+target family is chosen *outside* scx_teddy by writing single values into control
+files under `/tmp/scx_teddy/`, re-read every `--control-interval` seconds:
+
+- `control_ppid` — the target ppid (`0` = none)
+- `control_model` / `control_config` — an optional model + policy applied only to
+  the target family (empty = use the default policy for it too)
+
+Any program that can write a file can drive this. `target_finder_helper/` ships
+an example scanner that detects a running Steam game and publishes its ppid; see
+[`target_finder_helper/README.md`](target_finder_helper/README.md) for the
+protocol and how to write your own.
+
+## GUI
+
+[`gui/`](gui/README.md) is a Streamlit dashboard over this whole loop: Collect,
+Train, t-SNE visualization, Classify (with a live config editor + target
+selection), and an htop-style Overall view. See [`gui/README.md`](gui/README.md).
 
 ---
 
