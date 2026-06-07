@@ -17,3 +17,5 @@ probe_out/
 tools
 __pycache__
 _mock_stash
+develop
+*.dat
