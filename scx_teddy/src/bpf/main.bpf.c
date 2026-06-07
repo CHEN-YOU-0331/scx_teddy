@@ -205,7 +205,7 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     if (target_ctx->prio >= CRITICAL_PRIO) {
-        scx_bpf_dsq_insert(p, dsq_id(DEFAULT_PRIO, target_ctx->kind), DEFAULT_SLICE, wake_flags);
+        scx_bpf_dsq_insert(p, dsq_id(target_ctx->prio, target_ctx->kind), DEFAULT_SLICE, wake_flags);
         return prev_cpu;
     }
 
