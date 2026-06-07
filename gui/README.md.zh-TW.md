@@ -68,10 +68,11 @@ sudo ./run.sh
     (不存在就忽略)。
 - **Target family model + config**(可選，疊在 default 編輯器下方)：給特化目標一套
   **自己的** model + config(可與 default 不同 model — 雙 SchedSet 的重點)。
-  - 排程器**正在跑** → Apply 寫 `control_model`/`control_config`，scx_teddy 下個
-    poll 熱換(免重啟)。
-  - 排程器**還沒跑** → Apply 把設定 stage 進 session，Start 時帶
-    `--target-model/--target-config`(直接寫 control 檔會被 scx_teddy 初始化清掉)。
+  - 排程器**還沒跑** → 不顯示按鈕；編輯器當下的內容會在按 Start 時自動帶入
+    `--target-model/--target-config`(啟動前寫 control 檔會被 scx_teddy 初始化清掉，
+    所以根本不需要先「保存」)。
+  - 排程器**正在跑** → 才冒出「Apply target set」/「Clear target set」：Apply 寫
+    `control_model`/`control_config`，scx_teddy 下個 poll 熱換(免重啟)；Clear 回 default。
   - ⚠️ 這套只有在你**也選了 target ppid** 時才會套到任務上。
 - **Specialization target ppid**(Target 面板，見下)。
 - Predict period `-c` 預設 1s(scx_teddy 內建 600s 太慢)。

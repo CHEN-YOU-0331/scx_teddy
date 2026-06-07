@@ -173,7 +173,7 @@ def render_model_and_config(
 
     `with_save=True` adds a guarded "Save back to file" button for the
     "Existing file" source (Classify uses it; the target panel doesn't need it).
-    `default_config_path` seeds the "Existing file" path box.
+    `default_config_path` seeds the "Existing file" Custom-path box.
     """
     model_str = _render_model_picker(key_prefix, model_label)
 
@@ -188,10 +188,27 @@ def render_model_and_config(
 
     src_path = ""
     if config_mode == "Existing file":
-        seed = str(default_config_path or (runner.REPO_ROOT / "config.json"))
-        st.session_state.setdefault(f"{key_prefix}_config_path", seed)
-        src_path = st.text_input("Scheduling config JSON path to load & edit",
-                                 key=f"{key_prefix}_config_path")
+        # Dropdown of known configs (tmpfs config_*.json + repo-root config/),
+        # with a Custom-path escape hatch for anything elsewhere. Mirrors the
+        # model picker; seed-once + key-only so a background rerun can't reset it.
+        configs = [str(p) for p in runner.list_configs()]
+        cfg_custom_key = f"{key_prefix}_config_custom"
+        st.session_state.setdefault(cfg_custom_key, not configs)
+        cfg_custom = st.checkbox("Custom path", key=cfg_custom_key)
+        if cfg_custom:
+            seed = str(default_config_path or (runner.CONFIG_DIR / "config.json"))
+            st.session_state.setdefault(f"{key_prefix}_config_path", seed)
+            src_path = st.text_input("Scheduling config JSON path to load & edit",
+                                     key=f"{key_prefix}_config_path")
+        elif configs:
+            sel_key = f"{key_prefix}_config_select"
+            if st.session_state.get(sel_key) not in configs:
+                st.session_state[sel_key] = configs[0]
+            src_path = st.selectbox(
+                "Scheduling config JSON to load & edit", options=configs,
+                key=sel_key, label_visibility="collapsed")
+        else:
+            st.caption("No saved configs found — tick Custom path to type one.")
 
     # The table needs the model's cluster count. Without a readable model we
     # can't size it, so it vanishes (the caller's Start/Apply still renders).

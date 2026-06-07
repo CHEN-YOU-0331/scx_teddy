@@ -81,11 +81,13 @@ live with a trained model and apply the scheduling policy.
 - **Target family model + config** (optional, stacked under the default editor):
   gives the specialization target its **own** model + config — it can use a
   different model than the default (the point of two SchedSets).
-  - Scheduler **running** → Apply writes `control_model`/`control_config` and
-    scx_teddy hot-swaps it on its next poll (no restart).
-  - Scheduler **not yet running** → Apply stages the set in the session, and
-    Start passes `--target-model/--target-config` (writing the control files
-    before launch would be wiped by scx_teddy's init).
+  - Scheduler **not yet running** → no buttons; whatever the editor shows is
+    folded into `--target-model/--target-config` automatically when you press
+    Start (writing the control files before launch would be wiped by scx_teddy's
+    init, so there's nothing to "save" up front).
+  - Scheduler **running** → *Apply target set* / *Clear target set* buttons
+    appear: Apply writes `control_model`/`control_config` and scx_teddy
+    hot-swaps it on its next poll (no restart); Clear reverts to the default set.
   - ⚠️ This set only takes effect once you **also pick a target ppid**.
 - **Specialization target ppid** (Target panel, see below).
 - Predict period `-c` defaults to 1s (scx_teddy's built-in 600s is too slow).
