@@ -59,8 +59,13 @@ sudo ./run.sh
   (0=共用，否則 1-based，1=最快核；標籤按本機 topology 動態生成 P-core/E-core/
   tier-N)、**cpu_prefer**(no preference / prefer fast / prefer slow)。
   - Config 來源 radio：「Edit in GUI」從預設起編，「Existing file」載入磁碟上的
-    config 當底稿。Start 一律序列化到 /tmp 新檔再 `--config` 指它(原檔不動)；
-    「Existing file」模式有 guarded「Save back to file」可寫回原檔。
+    config 當底稿(下拉選，或勾 Custom path 手填)。Start 一律序列化到 /tmp 新檔再
+    `--config` 指它(原檔不動)；「Existing file」模式有 guarded「Save back to
+    file」可寫回原檔。
+  - **下拉掃描範圍**：model picker 與「Existing file」config 下拉除了掃 tmpfs 工作
+    目錄，**也掃** repo 根目錄的 `model/` 與 `config/`。把整理好的 model 放進
+    `model/`、config 放進 `config/`(任何 `*.json`)就會自動出現在這裡；目錄可有可無
+    (不存在就忽略)。
 - **Target family model + config**(可選，疊在 default 編輯器下方)：給特化目標一套
   **自己的** model + config(可與 default 不同 model — 雙 SchedSet 的重點)。
   - 排程器**正在跑** → Apply 寫 `control_model`/`control_config`，scx_teddy 下個

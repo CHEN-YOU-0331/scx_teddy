@@ -69,9 +69,15 @@ live with a trained model and apply the scheduling policy.
   local topology as P-core / E-core / tier-N), and **cpu_prefer** (no preference
   / prefer fast / prefer slow).
   - Config-source radio: *Edit in GUI* starts from defaults; *Existing file*
-    loads a config off disk as a seed. Start always serializes the table to a
-    fresh /tmp file and points `--config` at it (the original is never touched);
-    *Existing file* mode has a guarded *Save back to file* button.
+    loads a config off disk as a seed (dropdown, or *Custom path*). Start always
+    serializes the table to a fresh /tmp file and points `--config` at it (the
+    original is never touched); *Existing file* mode has a guarded *Save back to
+    file* button.
+  - **Where the dropdowns look:** both the model picker and the *Existing file*
+    config dropdown scan the tmpfs work dir **plus** the repo-root `model/` and
+    `config/` directories. Drop a curated model into `model/` or a config into
+    `config/` (any `*.json`) and it shows up here automatically; the dirs are
+    optional (ignored if absent).
 - **Target family model + config** (optional, stacked under the default editor):
   gives the specialization target its **own** model + config — it can use a
   different model than the default (the point of two SchedSets).

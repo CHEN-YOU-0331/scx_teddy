@@ -29,6 +29,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRAIN_PY = REPO_ROOT / "train.py"
 
+# Optional repo-root stash dirs for hand-placed models / configs. The Classify
+# pickers scan these in addition to the tmpfs data dir, so a user can drop a
+# curated model or config here and have it show up in the dropdowns. Missing
+# dirs are simply ignored.
+MODEL_DIR = REPO_ROOT / "model"
+CONFIG_DIR = REPO_ROOT / "config"
+
 # Built binary location (cargo workspace target). Allow override via env so a
 # release build or a custom path can be pointed at without code changes.
 DEFAULT_BIN = REPO_ROOT / "target" / "release" / "scx_teddy"
@@ -461,12 +468,36 @@ def list_files(pattern: str, directory: Path | None = None) -> list[Path]:
 
 
 def list_models(directory: Path | None = None) -> list[Path]:
-    """List model JSONs (model_*.json), excluding their *_result.json
-    siblings so a model appears once even though train.py writes a pair."""
-    return [
-        p for p in list_files("model_*.json", directory)
-        if not p.name.endswith("_result.json")
-    ]
+    """List model JSONs reachable in the Classify picker, newest first within
+    each source: the tmpfs data dir (train.py output, `model_*.json`) plus any
+    hand-placed models in the repo-root `model/` dir (any `*.json`). Both
+    exclude `*_result.json` siblings so a model appears once.
+
+    `directory` overrides only the tmpfs source (used by tests); MODEL_DIR is
+    always added when it exists.
+    """
+    tmp = [p for p in list_files("model_*.json", directory)
+           if not p.name.endswith("_result.json")]
+    stash = []
+    if MODEL_DIR.is_dir():
+        stash = sorted(
+            (p for p in MODEL_DIR.glob("*.json")
+             if p.is_file() and not p.name.endswith("_result.json")),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    return tmp + stash
+
+
+def list_configs(directory: Path | None = None) -> list[Path]:
+    """List scheduling-config JSONs for the Classify 'Existing file' dropdown:
+    the tmpfs data dir (GUI-written `config_*.json`) plus any hand-placed
+    configs in the repo-root `config/` dir (any `*.json`). Newest first within
+    each source. Missing CONFIG_DIR is ignored."""
+    tmp = list_files("config_*.json", directory)
+    stash = []
+    if CONFIG_DIR.is_dir():
+        stash = sorted((p for p in CONFIG_DIR.glob("*.json") if p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    return tmp + stash
 
 
 def copy_to(src: Path, dest_dir: Path, with_result: bool = False) -> list[Path]:
