@@ -144,17 +144,14 @@ def main() -> None:
 
     print(f"[scanner] watching for Steam games, writing ppid -> {CONTROL_PATH} "
           f"every {interval}s (Ctrl-C to stop)")
-    last = None
     try:
         while True:
             ppid = scan_once()
-            if ppid != last:
-                publish(ppid)
-                if ppid:
-                    print(f"[scanner] game family ppid = {ppid}")
-                else:
-                    print("[scanner] no game running — cleared target (0)")
-                last = ppid
+            publish(ppid)
+            if ppid:
+                print(f"[scanner] game family ppid = {ppid}")
+            else:
+                print("[scanner] no game running — cleared target (0)")
             time.sleep(interval)
     except KeyboardInterrupt:
         # Clear the target on exit so a stale ppid doesn't linger.
