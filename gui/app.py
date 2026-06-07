@@ -203,7 +203,8 @@ with tab_overall:
 import time as _time  # noqa: E402
 
 def _any_proc_running() -> bool:
-    for key in ("collect_handle", "train_handle", "classify_handle"):
+    for key in ("collect_handle", "train_handle", "classify_handle",
+                "scanner_handle"):
         h = st.session_state.get(key)
         if h is not None and h.is_running():
             return True

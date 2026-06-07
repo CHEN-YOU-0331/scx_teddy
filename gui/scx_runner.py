@@ -1,8 +1,9 @@
 """Subprocess wrappers around scx_teddy and train.py.
 
 Design constraints (from demo.md):
-  - No IPC layer. Control flows to scx_teddy purely by writing lines to its
-    stdin; data flows back by reading files under /tmp. The GUI can die and
+  - No IPC layer. Control flows to scx_teddy by writing single values into the
+    /tmp/scx_teddy/control_* files (an external scanner / the GUI / a manual
+    `echo`); data flows back by reading files under /tmp. The GUI can die and
     scx_teddy keeps running; scx_teddy runs fine with no GUI at all.
   - Everything here just shells out — the GUI stays a thin shell over the
     same commands a user could type by hand.
@@ -76,12 +77,12 @@ class ProcessHandle:
         self._on_exit(rc)
 
     def send_line(self, text: str) -> bool:
-        """Write one control line to the child's stdin.
+        """Write one line to the child's stdin.
 
-        Returns False if the pipe is already closed/dead. This is the GUI's
-        only control channel into scx_teddy; the line format is whatever the
-        scx_teddy stdin protocol ends up being (currently it treats a line as
-        a game name).
+        Returns False if the pipe is already closed/dead. Legacy channel from
+        the old stdin-control design; scx_teddy is now driven by the /tmp
+        control files (see write_control), so nothing here uses this anymore.
+        Kept because an open stdin pipe is harmless.
         """
         if self.proc.stdin is None or self.proc.poll() is not None:
             return False
@@ -135,6 +136,8 @@ def build_classify_argv(
     model: Path,
     config: Path,
     duration: int | None = None,
+    target_model: Path | None = None,
+    target_config: Path | None = None,
     use_sudo: bool = True,
 ) -> list[str]:
     """Build the argv for a `scx_teddy --mode classify` run.
@@ -147,6 +150,12 @@ def build_classify_argv(
     *period* — the main loop re-classifies every `duration` seconds. scx_teddy's
     built-in default (600s) is far too slow to feel interactive, so the GUI
     passes an explicit value (defaulting to 1s).
+
+    `target_model`/`target_config` (both or neither) seed the specialization
+    target set at startup via --target-model/--target-config. This is the only
+    way to set a target set *before* the scheduler runs: scx_teddy rebuilds the
+    /tmp control files on init, so writing them before launch would be wiped.
+    Once running, control_model/control_config (set_target_set) hot-swaps it.
     """
     argv: list[str] = []
     if use_sudo:
@@ -155,6 +164,101 @@ def build_classify_argv(
              "--model", str(model), "--config", str(config)]
     if duration is not None:
         argv += ["--collect-duration", str(duration)]
+    if target_model is not None and target_config is not None:
+        argv += ["--target-model", str(target_model),
+                 "--target-config", str(target_config)]
+    return argv
+
+
+# --- Specialization control files -------------------------------------------
+# scx_teddy specializes a task family by reading three single-value files (see
+# init_control_files / CONTROL_*_PATH in main.rs, and target_finder_helper/
+# README.md). The scheduler creates them root-owned (it runs under sudo for
+# BPF), so the GUI writes them via `sudo tee` — same cached-creds assumption as
+# every other command here. control_ppid picks the family; control_model /
+# control_config (classify only) give that family its own model + config (empty
+# = fall back to the default set).
+CONTROL_DIR = Path("/tmp/scx_teddy")
+CONTROL_PPID_PATH = CONTROL_DIR / "control_ppid"
+CONTROL_MODEL_PATH = CONTROL_DIR / "control_model"
+CONTROL_CONFIG_PATH = CONTROL_DIR / "control_config"
+
+# Directory of example scanners shipped in the repo. A scanner is any program
+# that writes control_ppid; they run under sudo so they can write that
+# root-owned file (the README documents this requirement). Discovered at
+# runtime so adding a new scanner there shows up in the GUI dropdown with no
+# code change here.
+SCANNER_DIR = REPO_ROOT / "target_finder_helper"
+
+
+def list_scanners() -> list[Path]:
+    """Executable scanner scripts under SCANNER_DIR (newest-name first is not
+    meaningful here, so sort by name). Currently just the .py examples; the
+    dropdown is populated from this so future scanners need no code change."""
+    if not SCANNER_DIR.is_dir():
+        return []
+    return sorted(p for p in SCANNER_DIR.glob("*.py") if p.is_file())
+
+
+def write_control(path: Path, value: str, use_sudo: bool = True) -> None:
+    """Write a single value into a (root-owned) control file via `sudo tee`.
+
+    The one place the GUI writes a control file. Value goes in on stdin so it
+    never lands in the process table. `tee`'s stdout is discarded. Raises
+    CalledProcessError on failure (e.g. sudo creds expired) for the caller to
+    surface; mirrors the "surface, don't prompt" stance of the run commands.
+    """
+    argv = (["sudo", "tee", str(path)] if use_sudo else ["tee", str(path)])
+    subprocess.run(argv, input=value, text=True, check=True,
+                   stdout=subprocess.DEVNULL)
+
+
+def set_target_ppid(ppid: int) -> None:
+    """Point the specialization target at `ppid` (0 clears it)."""
+    write_control(CONTROL_PPID_PATH, str(int(ppid)))
+
+
+def clear_target_ppid() -> None:
+    """Clear the specialization target (control_ppid = 0)."""
+    set_target_ppid(0)
+
+
+def set_target_set(model: Path | None, config: Path | None) -> None:
+    """Set (or clear) the target family's own model + config.
+
+    Written as a pair: both paths together, or both empty to fall back to the
+    default set. scx_teddy treats either one empty as "use default", so passing
+    only one is pointless — callers should always supply both or neither.
+
+    TODO: validate the model↔config cluster-count pairing here (separate TODO);
+    scx_teddy doesn't enforce it (an unknown cluster falls back to default).
+    """
+    write_control(CONTROL_MODEL_PATH, str(model) if model else "")
+    write_control(CONTROL_CONFIG_PATH, str(config) if config else "")
+
+
+def clear_target_set() -> None:
+    """Clear control_model / control_config (target family uses the default)."""
+    set_target_set(None, None)
+
+
+def read_control_ppid() -> int | None:
+    """Read back the current control_ppid for display. Plain read (no sudo —
+    the file is world-readable); malformed/missing → None."""
+    try:
+        return int(CONTROL_PPID_PATH.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def build_scanner_argv(scanner: Path, interval: int = 5,
+                       use_sudo: bool = True) -> list[str]:
+    """Build the argv to run a chosen scanner script. It writes control_ppid
+    itself, so it needs sudo (root-owned file); -E preserves env. The scanner
+    takes the scan interval (s) as its one positional arg (the example honours
+    it; a custom scanner may ignore it)."""
+    argv = ["sudo", "-E"] if use_sudo else []
+    argv += [sys.executable, str(scanner), str(int(interval))]
     return argv
 
 

@@ -15,6 +15,7 @@ import streamlit as st
 import scx_runner as runner
 
 from ._common import proc_log_to_session, kick_rerun_soon
+from . import _target
 
 
 def render():
@@ -42,6 +43,11 @@ def render():
     cycle = c1.number_input("Cycle (s)", min_value=1, value=600, step=10)
     maxrt = c2.number_input("Max runtime (s, 0=∞)", min_value=0, value=0, step=30)
     checkpoint = c3.checkbox("Checkpoint CSV each cycle", value=True)
+
+    # Optional: pick a specialization target ppid. In collect mode this just
+    # marks the family — the CSV's `ancestor` column converges to the target so
+    # the family's tasks are identifiable in analysis.
+    _target.render_target_panel("collect")
 
     handle = st.session_state.get("collect_handle")
     running = handle is not None and handle.is_running()
