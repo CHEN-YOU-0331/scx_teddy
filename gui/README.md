@@ -1,75 +1,118 @@
 # scx_teddy Dashboard · Streamlit
 
-> **三個分頁,全部接真後端**(Collect / Train / Static t-SNE)。仿真版實時儀表板(Overall / Per-task / Cluster)的 code 跟假資料一起放在 `_mock_stash/`,**不進 git**;之後一個一個改成真版時搬進 `tabs/`。
+> 繁體中文版：[README.md.zh-TW.md](README.md.zh-TW.md)
 
-## 結構
+A thin-shell GUI over scx_teddy and `train.py`: it only ever shells out the same
+commands you could type by hand (everything flows through `scx_runner.py`), so
+the GUI can die and a running scheduler keeps going. scx_teddy needs root for
+BPF, so the run commands are wrapped in `sudo` — the GUI assumes you can sudo.
 
-```
-gui/
-  app.py              ← 入口:CSS、sidebar、三個 tab
-  theme.py            ← 配色 / P-E core 編號 / Tier 名(仿真版也會用)
-  scx_runner.py       ← subprocess + 檔案管理(起 scx_teddy / train.py、時間戳命名、列檔、複製)
-  run.sh              ← 啟動腳本(鎖 venv、設深色主題)
-  tabs/               ← 真後端三頁
-    _common.py        ← 共用 helper(log buffer、rerun 觸發)
-    collect.py
-    train.py
-    static_tsne.py
-  _mock_stash/        ← gitignore 這整個目錄
-    mock_data.py
-    overall_page.py
-    per_task_page.py
-    cluster_page.py
-```
+## Setup
 
-**為什麼目錄叫 `tabs/` 而不是 `pages/`**:Streamlit 看到 entry script 旁邊有 `pages/` 子目錄會**自動**把它當 multipage app 處理,把每個 `.py` 列進左側 sidebar — 就跟我們的頂部 tabs 重複了。換名字避開這機制。
-
-要讓 git 忽略 `_mock_stash/`,在 repo 根目錄 `.gitignore` 加一行:`gui/_mock_stash/`。
-
-## 啟動
+Create the repo-root venv once and install the dependencies (`requirements.txt`
+includes `streamlit`, `plotly`, etc.):
 
 ```sh
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+`run.sh` locks onto this `venv/bin/python3` itself, so you don't have to
+activate the venv manually before launching.
+
+## Launch
+
+```sh
+cd gui
 sudo ./run.sh
 ```
 
-會自動鎖 repo `venv/bin/python3`、開深色主題、`streamlit run app.py`。
-預設打開 <http://localhost:8501>(會跳預設瀏覽器)。
+Locks the repo `venv/bin/python3`, dark theme, headless `streamlit run app.py`,
+at <http://localhost:8501> by default.
 
-依賴:`streamlit` 與 `plotly`,已加進 `requirements.txt`。
+## The five tabs
 
-## 三個分頁
+### 📥 Collect
+Runs `sudo -E scx_teddy --mode collect`, writing each task's features to a CSV.
+- Output defaults to `/tmp/scx_teddy_gui` (tmpfs); tick *Custom output dir* to
+  choose another location. Filenames are always timestamped automatically.
+- Streams the log / Stop sends SIGINT for a clean exit (flushes the CSV) / Clear
+  `.csv` wipes them in one click.
+- Lists saved CSVs below; multi-select to copy them to a chosen directory.
+- **Specialization target**: optionally pick a target ppid (see *Target panel*
+  below). In collect mode this only *marks* the family — the CSV's `ancestor`
+  column converges to that ppid so the whole family is identifiable in analysis.
 
-### 📥 Collect · 真後端
-- 跑 `sudo -E scx_teddy --mode collect`(BPF 需要 root)。
-- 預設輸出 `/tmp/scx_teddy_gui`,勾「Custom output dir」可直接寫 SSD。檔名一律時間戳自動命名(絕不撞「已存在」)。
-- 串流 log 顯示 / Stop 送 SIGINT 乾淨退出 / Clear `.csv` 一鍵清空。
-- 下方列出 saved CSVs,多選後可複製到指定目錄。
+### 🧠 Train
+Runs `train.py` to train KMeans, producing `model_<ts>.json` plus its sibling
+`_result.json` (per-cluster membership).
+- The Input CSV dropdown defaults to the most recent collect. Leave K blank for
+  automatic elbow selection.
 
-### 🧠 Train · 真後端
-- 跑 `train.py` 訓練 KMeans,輸出 `model_<ts>.json` + 旁邊的 `_result.json`。
-- Input CSV 下拉預設選最近一次 collect 的(`runner.last_csv`)。
-- Custom model out dir 同 Collect。K 留空 = elbow 自動選。
+### 🗺 Static t-SNE
+Runs t-SNE on any CSV, plotted with plotly (zoomable, hover shows tid/comm).
+- Both the CSV and the cluster-result JSON can be picked from a /tmp dropdown or
+  via *Custom path* for an arbitrary location.
+- Three colour modes: single colour / by KMeans cluster / highlight
+  `tgid=1234,5678` (the target group is coloured, the rest greyed).
 
-### 🗺 Static t-SNE · 真後端
-- 對任一 CSV 跑 t-SNE,**plotly 出圖**(可縮放、hover 顯示 tid/comm)。
-- 預設選最近 CSV 與最近 model 的 `_result.json`。
-- Highlight 框輸 `tgid=1234,5678`,把目標群染紅、其他變灰。
+### 🎯 Classify
+Runs `sudo -E scx_teddy --mode classify --model M --config C` to classify tasks
+live with a trained model and apply the scheduling policy.
 
-## 仿真版實時儀表板(`_mock_stash/`,不進 git)
+- **Model + scheduling config editor** (the shared `tabs/_config_editor.py`):
+  pick a model and the table below is auto-sized to its cluster count (extras
+  dropped, missing ones filled with defaults). Each row edits **prio** (0 =
+  highest, 11 = lowest), **slice_ns** (floored at 100000), **cpu_kind** (0 =
+  shared, otherwise 1-based, 1 = fastest tier; labels are generated from the
+  local topology as P-core / E-core / tier-N), and **cpu_prefer** (no preference
+  / prefer fast / prefer slow).
+  - Config-source radio: *Edit in GUI* starts from defaults; *Existing file*
+    loads a config off disk as a seed. Start always serializes the table to a
+    fresh /tmp file and points `--config` at it (the original is never touched);
+    *Existing file* mode has a guarded *Save back to file* button.
+- **Target family model + config** (optional, stacked under the default editor):
+  gives the specialization target its **own** model + config — it can use a
+  different model than the default (the point of two SchedSets).
+  - Scheduler **running** → Apply writes `control_model`/`control_config` and
+    scx_teddy hot-swaps it on its next poll (no restart).
+  - Scheduler **not yet running** → Apply stages the set in the session, and
+    Start passes `--target-model/--target-config` (writing the control files
+    before launch would be wiped by scx_teddy's init).
+  - ⚠️ This set only takes effect once you **also pick a target ppid**.
+- **Specialization target ppid** (Target panel, see below).
+- Predict period `-c` defaults to 1s (scx_teddy's built-in 600s is too slow).
+- Streams the log / Stop sends SIGINT to tear the scheduler down.
 
-三頁:**Overall**(整機脈動 + per-CPU strip + Top-20 表)、**Per-task**(挑任務看歷史 + tier/slice/features)、**Cluster**(假 t-SNE + highlight)。配色與布局已定型,等 scx_teddy 端能匯出實時資料時搬進 `tabs/`。
+### 📊 Overall
+An htop-style live dashboard, whole-machine + per-task, refreshing at 1 Hz via
+`@st.fragment(run_every="1s")` (scoped to this tab, so typing in others isn't
+interrupted).
+- Top metrics: total CPU% / RAM / active task count / core-group makeup.
+- Per-CPU bars: one bar per logical CPU, auto-coloured by cpufreq grouping (P/E
+  not hardcoded).
+- Task table: every task (virtualised scroll), sorted by CPU%, with comm / tgid
+  / ppid filters. The whole-machine part is pure /proc — it never touches
+  scx_teddy.
+- **The classification columns (cluster / prio / cpu_kind / slice) read the
+  classify snapshot**: once classify is running, scx_teddy atomically writes
+  `/tmp/scx_teddy/snapshot.json` (tid → classification state) each cycle, and
+  Overall joins it in by tid. These columns stay blank when classify isn't
+  running.
 
-本機要看效果:把 `app.py` 裡 `MOCK_TABS_ENABLED = False` 改成 `True`(別 commit)。
+## Target panel (`tabs/_target.py`, shared by Collect and Classify)
 
-## 配色 & 視覺設計理念(`theme.py`)
+Picks which ppid family to specialize. Writes `/tmp/scx_teddy/control_ppid`
+(root-owned, so the GUI writes it via `sudo tee`), which scx_teddy re-reads every
+`--control-interval` seconds. A radio offers two modes:
 
-- **深色主題 + plotly_dark**:長時間看不累、顏色更跳。
-- **P-core 紅 / E-core 藍**:溫度直覺(perf=熱,efficiency=冷),一眼分得出 hybrid 兩半。
-- **Tier 顏色**:CRITICAL 紅 → BATCH 灰,亮度遞減,眼睛自然先看到要緊的。
-- **Cluster 用 matplotlib `tab10`** 同款 palette,跟 sklearn / matplotlib 預設一致。
-- **Active tab 用珊瑚紅**邊框 + 加粗,跟整體配色呼應。
+- **Manual**: type a ppid, Set / Clear (0).
+- **Scanner**: pick a scanner script from a dropdown of `target_finder_helper/`
+  (currently one Steam example, `game_task_finder.py`; the dropdown scans the
+  directory, so adding a scanner needs no code change). Start runs it as a
+  subprocess that keeps writing control_ppid; Stop sends SIGINT (the scanner
+  writes 0 on Ctrl-C to clear the target).
 
-## 後續
-
-- 把仿真版三頁一個一個改成真後端(資料源從 mock 換成 scx_teddy ringbuf / /proc / cgroup 等)。
-- 屆時把對應 `*_page.py` 從 `_mock_stash/` 搬進 `tabs/`,設計樣式直接沿用。
+The current control_ppid is shown live at the top of the panel. For the full
+protocol see `target_finder_helper/README.md`.
