@@ -68,7 +68,8 @@ def _render_target_set_editor(running: bool):
                 else:
                     try:
                         clusters, default = _config_editor.df_to_config(tdf)
-                        config_p = runner.write_config(clusters, default)
+                        config_p = runner.write_config(
+                            clusters, default, prefix="target_config")
                         runner.set_target_set(model_p, config_p)
                         st.toast("Target set → control files (hot-swapped).")
                     except Exception as e:  # noqa: BLE001 — surface sudo/IO failure
@@ -145,7 +146,10 @@ def render():
                 tmp = Path(tmodel_str) if tmodel_str else None
                 if tmp is not None and tmp.exists() and tdf is not None:
                     tclusters, tdefault = _config_editor.df_to_config(tdf)
-                    target_config = runner.write_config(tclusters, tdefault)
+                    # Distinct prefix so it can't alias the default config above
+                    # (same-second timestamp would otherwise collide).
+                    target_config = runner.write_config(
+                        tclusters, tdefault, prefix="target_config")
                     target_model = tmp
                 argv = runner.build_classify_argv(
                     model_p, config_p, duration=int(period),

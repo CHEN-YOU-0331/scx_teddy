@@ -385,15 +385,22 @@ def _config_json(clusters: dict[str, dict], default: dict) -> str:
 
 
 def write_config(clusters: dict[str, dict], default: dict,
-                 directory: Path | None = None) -> Path:
+                 directory: Path | None = None, prefix: str = "config") -> Path:
     """Serialize a {clusters, default} scheduling config to a fresh timestamped
     JSON under the data dir (tmpfs by default) and return its path.
 
     Writing to /tmp keeps the GUI-built config out of the repo and means the
     "edit in the GUI" path is just "write a file, then `--config` it" — no new
     channel, same thin-shell model as everything else here.
+
+    `prefix` distinguishes configs written back-to-back: classify Start writes
+    the default config and the target config in the same call. The timestamp is
+    second-resolution, so without distinct prefixes they'd collide on the same
+    name and the second write would clobber the first — both --config and
+    --target-config ending up at one file with the target's contents. Pass
+    "target_config" for the target so the two paths never alias.
     """
-    out = timestamped_path("config", "json", directory=directory)
+    out = timestamped_path(prefix, "json", directory=directory)
     out.write_text(_config_json(clusters, default))
     return out
 
