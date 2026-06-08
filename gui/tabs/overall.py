@@ -257,6 +257,11 @@ def _live_body():
             "ppid": t.ppid,
             "CPU%": round(t.cpu_pct, 1),
             "RAM(MB)": round(t.ram_mb, 1),
+            # 🎯 marks a task in the target family (its ancestor converged to
+            # the control ppid, so it was scheduled with the target set). Blank
+            # — not "" vs "🎯" both being strings is fine here, the column is
+            # all-string — for non-target so only targets stand out visually.
+            "target": "🎯" if (s and s.get("is_target")) else "",
             # Joined from the classify snapshot by tid. Use None (not "—") for
             # the miss case so each column keeps one numeric dtype — a mixed
             # str/float column can't serialize to Arrow. Streamlit renders a
@@ -287,6 +292,9 @@ def _live_body():
             "CPU%": st.column_config.ProgressColumn(
                 "CPU%", min_value=0, max_value=100, format="%.1f%%"),
             "RAM(MB)": st.column_config.NumberColumn("RAM(MB)", format="%.0f"),
+            "target": st.column_config.TextColumn(
+                "🎯", help="Marked when this task is in the target family "
+                "(scheduled with the target set, not the default set)."),
             "cluster": st.column_config.NumberColumn(
                 "cluster", help="KMeans cluster id this task was classified into."),
             "prio": st.column_config.NumberColumn(

@@ -342,7 +342,8 @@ SNAPSHOT_PATH = Path("/tmp/scx_teddy/snapshot.json")
 
 def read_snapshot() -> dict[int, dict] | None:
     """Read the classify snapshot, keyed by tid for an O(1) join against the
-    /proc task list. Each value is {cluster, prio, slice_ns, cpu_kind}.
+    /proc task list. Each value is {cluster, prio, slice_ns, cpu_kind,
+    cpu_prefer, is_target}.
 
     Returns None when there's nothing to show (file missing — no classify run —
     or a transient read that lost the rename race / malformed). The caller

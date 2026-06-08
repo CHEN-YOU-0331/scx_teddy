@@ -538,6 +538,9 @@ struct TaskSnapshot {
     slice_ns: u64,
     cpu_kind: u8,
     cpu_prefer: u8,
+    /// True if this task belongs to the target family (its `ancestor`
+    /// converged to `target_ppid`), i.e. it was scheduled with the target set.
+    is_target: bool,
 }
 
 /// Atomically publish the cycle's snapshot: write a sibling `.tmp` then rename
@@ -616,8 +619,9 @@ fn run_classify_cycle(
 
         // Target family (ancestor converged to target) uses the target set if
         // one exists; everything else uses the default.
+        let is_target = target_ppid != 0 && ts.ancestor == target_ppid;
         let mut set = default_set;
-        if target_ppid != 0 && ts.ancestor == target_ppid {
+        if is_target {
              if let Some(s) = target_set {
                 set = s;
             }
@@ -640,6 +644,7 @@ fn run_classify_cycle(
             tid, cluster, prio, slice_ns,
             cpu_kind: cluster_cfg.cpu_kind,
             cpu_prefer: cluster_cfg.cpu_prefer,
+            is_target,
         });
 
         // Write sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}
