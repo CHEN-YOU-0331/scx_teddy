@@ -181,6 +181,40 @@ struct Args {
 
 unsafe impl Plain for TaskEvent {}
 
+/// cpu_prefer "prefer slowest kind" (mirrors CPU_SLOW_PREFER in bpf/intf.h).
+const CPU_SLOW_PREFER: u8 = 2;
+/// Default time slice in ns used to seed scx_teddy's own thread (mirrors
+/// DEFAULT_SLICE = 100 * 1000 in bpf/intf.h).
+const DEFAULT_SLICE_NS: u64 = 100 * 1000;
+
+/// This thread's kernel tid (`gettid(2)`).
+fn own_tid() -> i32 {
+    extern "C" {
+        fn gettid() -> i32;
+    }
+    unsafe { gettid() }
+}
+
+/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}` and
+/// write it into `update_map` for `tid`.
+fn write_sched_info(
+    update_map: &libbpf_rs::Map,
+    tid: i32,
+    prio: i32,
+    cpu_kind: u8,
+    cpu_prefer: u8,
+    slice_ns: u64,
+) -> Result<()> {
+    let tid_key = tid.to_ne_bytes();
+    let mut val_buf = [0u8; 16];
+    val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
+    val_buf[4] = cpu_kind;
+    val_buf[5] = cpu_prefer;
+    val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
+    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+    Ok(())
+}
+
 fn thread_cpu_time() -> Duration {
     #[repr(C)]
     struct Timespec { tv_sec: i64, tv_nsec: i64 }
@@ -586,6 +620,7 @@ fn run_classify_cycle(
     target_set: Option<&SchedSet>,
     min_events: u64,
     target_ppid: i32,
+    own_tid: i32,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     // GUI Overall feed: one entry per task predicted this cycle (i.e. that
@@ -598,6 +633,11 @@ fn run_classify_cycle(
     let mut predict_count: usize = 0;
 
     for (&tid, cell) in stats_map.iter() {
+        // Never reclassify scx_teddy's own thread.
+        if tid == own_tid {
+            continue;
+        }
+
         let mut ts = cell.borrow_mut();
         if ts.exit != 0 || ts.event_count < min_events {
             continue;
@@ -647,16 +687,8 @@ fn run_classify_cycle(
             is_target,
         });
 
-        // Write sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}
-        // to update_map. C layout (8-byte aligned):
-        //   prio[0..4] | kind[4] | cpu_prefer[5] | pad[6..8] | slice[8..16]
-        let tid_key = tid.to_ne_bytes();
-        let mut val_buf = [0u8; 16];
-        val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
-        val_buf[4] = cluster_cfg.cpu_kind;
-        val_buf[5] = cluster_cfg.cpu_prefer;
-        val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
-        update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+        write_sched_info(update_map, tid, prio,
+            cluster_cfg.cpu_kind, cluster_cfg.cpu_prefer, slice_ns)?;
     }
 
     // Publish the snapshot for the GUI. Done before the timing log so the
@@ -851,6 +883,12 @@ fn main() -> Result<()> {
 
     log!(logger, "scx_teddy scheduler loaded successfully!");
 
+    // Give it the highest priority (0) so it is never starved by its own policy
+    let own_tid = own_tid();
+    write_sched_info(update_map, own_tid, 0, 0, CPU_SLOW_PREFER, DEFAULT_SLICE_NS)
+        .context("Failed to seed scx_teddy's own scheduling info")?;
+    log!(logger, "seeded own tid {} at prio 0, kind 0, prefer slow (self-protection)", own_tid);
+
     // Shutdown flag: set by Ctrl+C, watched by the main loop.
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ctrlc = Arc::clone(&shutdown);
@@ -913,7 +951,7 @@ fn main() -> Result<()> {
             if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
                     default_set, target_set.as_ref(), args.min_events,
-                    target_ppid.get(), &logger)?;
+                    target_ppid.get(), own_tid, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
