@@ -100,7 +100,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
     if (!e) {
-        bpf_printk("RINGBUF_FULL");
+        //bpf_printk("RINGBUF_FULL");
         return; // Ring buffer full, drop event
     }
 
@@ -441,6 +441,26 @@ void BPF_STRUCT_OPS(teddy_exit, struct scx_exit_info *ei)
     UEI_RECORD(uei, ei);
 }
 
+void BPF_STRUCT_OPS(teddy_dump_task, struct scx_dump_ctx *dctx, struct task_struct *p)
+{
+    target_ctx_t *target_ctx = get_target_storage(p);
+    if (!target_ctx)
+        return;
+
+    if (target_ctx->runtime_ns > 10000000) {
+        scx_bpf_dump("===\n%s tid: %d run for %llu ns prio: %d, cpu: %d, slice: %d\n===\n",
+            p->comm, p->pid, target_ctx->runtime_ns, target_ctx->prio, target_ctx->kind, 
+            target_ctx->slice);
+    } else { // stall task
+        u64 wait_ns = dctx->at_ns - target_ctx->sleep_end;
+        if (wait_ns > 1000000000ULL)
+            scx_bpf_dump("%s tid: %d stall for %llu ns  prio: %d, cpu: %d, slice: %d\n", 
+                p->comm, p->pid, wait_ns, target_ctx->prio, target_ctx->kind, 
+                target_ctx->slice);
+
+    }
+}
+
 SCX_OPS_DEFINE(teddy_ops,
                .select_cpu     = (void *)teddy_select_cpu,
                .enqueue        = (void *)teddy_enqueue,
@@ -452,6 +472,7 @@ SCX_OPS_DEFINE(teddy_ops,
                .exit_task      = (void *)teddy_exit_task,
                .init           = (void *)teddy_init,
                .exit           = (void *)teddy_exit,
+               .dump_task      = (void *)teddy_dump_task,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,
                .name           = "teddy");
 
