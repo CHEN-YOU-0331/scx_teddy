@@ -226,6 +226,8 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
     if (target_ctx->cpu_prefer == CPU_NO_PREFER && target_ctx->kind == 0) {
         bool is_idle;
         cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+        if (!is_idle)
+            cpu = -1;
     } else {
         /* Fast/slow preference: scan CPUs in the preferred speed order and claim
         * the first idle one that fits kind + affinity. */
