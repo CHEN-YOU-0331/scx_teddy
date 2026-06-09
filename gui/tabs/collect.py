@@ -42,7 +42,12 @@ def render():
     c1, c2, c3 = st.columns(3)
     cycle = c1.number_input("Cycle (s)", min_value=1, value=600, step=10)
     maxrt = c2.number_input("Max runtime (s, 0=∞)", min_value=0, value=0, step=30)
-    checkpoint = c3.checkbox("Checkpoint CSV each cycle", value=True)
+    checkpoint = c3.checkbox(
+        "Checkpoint CSV each cycle", value=False,
+        help="Write the CSV every cycle instead of once on shutdown. Off by "
+             "default: a mid-run checkpoint can record a task's `ancestor` "
+             "before a freshly detected target ppid has propagated, mislabelling "
+             "the family. Enable only if you need crash-safety over correctness.")
 
     # Optional: pick a specialization target ppid. In collect mode this just
     # marks the family — the CSV's `ancestor` column converges to the target so
